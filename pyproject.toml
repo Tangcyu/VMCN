@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tensorq"
+version = "0.1.0"
+description = "Shared TensorQ package for next-hit and pair-wise committors."
+requires-python = ">=3.9"
+dependencies = [
+  "matplotlib",
+  "numpy",
+  "pandas",
+  "pyyaml",
+  "torch",
+  "tqdm",
+]
+
+[project.optional-dependencies]
+label = [
+  "MDAnalysis",
+  "scikit-learn",
+  "scipy",
+]
+
+[project.scripts]
+tensorq-label = "tensorq.next_hit.label:main"
+tensorq-next-hit-train = "tensorq.next_hit.train:main"
+tensorq-next-hit-infer = "tensorq.next_hit.infer:main"
+tensorq-next-hit-plot = "tensorq.next_hit.plot:main"
+tensorq-next-hit-rate = "tensorq.next_hit.rate_constant:main"
+tensorq-pairwise-train = "tensorq.pairwise.train:main"
+tensorq-pairwise-infer = "tensorq.pairwise.infer:main"
+tensorq-pairwise-plot = "tensorq.pairwise.plot:main"
+tensorq-pairwise-rate = "tensorq.pairwise.rate_constant:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

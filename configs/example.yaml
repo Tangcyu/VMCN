@@ -1,0 +1,143 @@
+# TensorQ combined example configuration.
+# The dataset produced by TENSORQ_LABEL is shared by both model families.
+
+TENSORQ_LABEL:
+  topology_file: "PATH/TO/system.psf"
+  dcd_folder: "PATH/TO/dcd_folder"
+  match: "shoot_"
+  output_dir: "./dataset_out"
+  dataset_path: "./dataset_out/dataset.pt"
+  save_format: "pt"
+  save_cv: true
+  sel_weights: "protein and not name H*"
+  every: 1
+  colvars_mismatch: true
+  trajectory_workers: 1
+  feature_chunk_size: 250
+  distance_backend: "serial"
+  write_concat_dcd: false
+  cvs_to_save: []
+  periodic: false
+  reweight: true
+  riteweight_space: "features"
+  riteweight:
+    lag: 1
+    n_clusters: 100
+    n_iter: 200
+    tol: 1.0e-6
+    tol_window: 5
+    avg_last: 20
+    seed: 2026
+  labeling_method: "kmeans"
+  cluster_space: "features"
+  standardize_features: true
+  pca_cluster_dim: 20
+  n_clusters: null
+  kmin: 2
+  kmax: 12
+  elbow_method: "knee"
+  intermediate_quantile: 0.9
+  kmeans_random_state: 0
+  kmeans_n_init: "auto"
+  write_diag_plots: true
+  plot_kmeans_centroids: false
+  centroid_plot_cvs: ["CV1", "CV2"]
+
+NEXT_HIT_COMMITTOR:
+  dataset_path: "./dataset_out/dataset.pt"
+  out_dir: "./next_hit_train"
+  label: "next_hit_committor"
+  device: "cuda:0"
+  seed: 0
+  model_input_space: "features"
+  lag: 1
+  val_ratio: 0.1
+  require_labeled: "none"
+  batch_size: 2048
+  epochs: 500
+  patience: 30
+  lr: 1.0e-3
+  weight_decay: 1.0e-6
+  use_amp: true
+  model:
+    hidden: [256, 256, 128]
+    activation: "elu"
+    dropout: 0.0
+    output_normalization: "softmax"
+  loss:
+    lambda_dir: 1.0
+    lambda_bc: 10.0
+    lambda_flux: 0.1
+    n_thresholds: 9
+    flux_eps: 0.02
+
+NEXT_HIT_INFER:
+  dataset: "./dataset_out/dataset.pt"
+  model: "./next_hit_train/next_hit_committor_best_checkpoint.pt"
+  out_dir: "./next_hit_infer"
+  device: "cuda:0"
+  save_csv: true
+
+NEXT_HIT_PLOT:
+  dataset: "./dataset_out/dataset.pt"
+  model: "./next_hit_train/next_hit_committor_best_checkpoint.pt"
+  out_dir: "./next_hit_plots"
+  planes: []
+
+NEXT_HIT_RATE:
+  dataset: "./dataset_out/dataset.pt"
+  model: "./next_hit_train/next_hit_committor_best_checkpoint.pt"
+  out_dir: "./next_hit_rate"
+  lag: 1
+  lag_reference: "original_frames"
+  n_thresholds: 9
+  flux_eps: 0.02
+  divide_by_tau: true
+
+PAIRWISE_COMMITTOR:
+  dataset_path: "./dataset_out/dataset.pt"
+  out_dir: "./pairwise_committor_train"
+  label: "pairwise_committor"
+  device: "cuda:0"
+  seed: 0
+  model_input_space: "features"
+  lag: 1
+  val_ratio: 0.1
+  require_labeled: "both"
+  batch_size: 2048
+  epochs: 200
+  patience: 30
+  lr: 1.0e-3
+  weight_decay: 1.0e-6
+  use_amp: true
+  model:
+    hidden: [256, 256, 128]
+    activation: "elu"
+    dropout: 0.0
+    output_activation: "sigmoid"
+  loss:
+    lambda_dirichlet: 1.0
+    lambda_endpoint: 100.0
+
+PAIRWISE_INFER:
+  dataset: "./dataset_out/dataset.pt"
+  model: "./pairwise_committor_train/pairwise_committor_best_checkpoint.pt"
+  out_dir: "./pairwise_committor_infer"
+  device: "cuda:0"
+  save_csv: true
+
+PAIRWISE_PLOT:
+  dataset: "./dataset_out/dataset.pt"
+  model: "./pairwise_committor_train/pairwise_committor_best_checkpoint.pt"
+  out_dir: "./pairwise_committor_plots"
+  planes: []
+
+PAIRWISE_RATE:
+  dataset: "./dataset_out/dataset.pt"
+  model: "./pairwise_committor_train/pairwise_committor_best_checkpoint.pt"
+  out_dir: "./pairwise_committor_rate"
+  lag: 1
+  lag_reference: "original_frames"
+  n_thresholds: 9
+  flux_eps: 0.02
+  divide_by_tau: true
