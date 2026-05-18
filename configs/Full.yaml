@@ -1,0 +1,787 @@
+# ============================================================
+# TensorQ Full Configuration Reference
+# ============================================================
+#
+# This file documents the full TensorQ workflow in one place.
+#
+# Workflow:
+#   1. Build or relabel a shared dataset:
+#        python scripts/label.py --config configs/Full.yaml
+#        python scripts/label.py --config configs/Full.yaml --relabel-only
+#
+#   2. Train / infer / plot / estimate rates for next-hit committors:
+#        python scripts/next_hit_train.py --config configs/Full.yaml
+#        python scripts/next_hit_infer.py --config configs/Full.yaml
+#        python scripts/next_hit_plot.py --config configs/Full.yaml
+#        python scripts/next_hit_rate.py --config configs/Full.yaml
+#
+#   3. Train / infer / plot / estimate rates for pair-wise committors:
+#        python scripts/pairwise_train.py --config configs/Full.yaml
+#        python scripts/pairwise_infer.py --config configs/Full.yaml
+#        python scripts/pairwise_plot.py --config configs/Full.yaml
+#        python scripts/pairwise_rate.py --config configs/Full.yaml
+#
+# Dataset convention:
+#   TENSORQ_LABEL writes one shared dataset containing:
+#     features, weights, meta_state, dist_to_centroid, meta,
+#     and optionally cv and traj_id.
+#   NEXT_HIT_* and PAIRWISE_* consume the same dataset.
+#
+# Naming:
+#   next-hit committor: multi-state q_j(z), normalized over states.
+#   pair-wise committor: unordered pair columns Q_ij(z), reconstructed to P_j(z).
+
+
+# ============================================================
+# 1. Shared Dataset Construction And Labeling
+# ============================================================
+TENSORQ_LABEL:
+  # ---- Required trajectory inputs ----
+  # Topology file used by MDAnalysis for each DCD trajectory.
+  topology_file: "PATH/TO/system.psf"
+
+  # Directory searched recursively for DCD files.
+  dcd_folder: "PATH/TO/dcd_folder"
+
+  # Use DCD files whose basename starts with this prefix.
+  # Each DCD is expected to have a matching "<basename>.colvars.traj".
+  match: "shoot_"
+
+  # ---- Outputs ----
+  # Output directory for dataset.pt, weights_and_labels.csv, label.log, and plots.
+  output_dir: "./dataset_out"
+
+  # Dataset output path. If omitted, TensorQ writes output_dir/dataset.pt or
+  # output_dir/dataset.npz depending on save_format.
+  dataset_path: "./dataset_out/dataset.pt"
+
+  # Dataset serialization format. Use "pt" for Torch-native workflows.
+  save_format: "pt"              # "pt" or "npz"
+
+  # Save CV data into the dataset and write weights_and_labels.csv.
+  # Keep true if you want later plotting in CV space.
+  save_cv: true
+
+  # ---- Atom selections and trajectory reading ----
+  # Atom selection used for internal-coordinate feature extraction.
+  sel_weights: "protein and not name H*"
+
+  # Optional atom selection for concatenated output DCDs. If omitted, sel_weights is reused.
+  sel_output: "protein and not name H*"
+
+  # Read every Nth DCD frame and matching colvars row.
+  every: 1
+
+  # Many colvars files contain one extra initial row relative to the DCD.
+  # true drops the first loaded colvars row before applying every.
+  colvars_mismatch: true
+
+  # Number of worker threads for loading trajectory/colvars blocks.
+  # Use 1 for debugging; use a larger value for many independent trajectories.
+  trajectory_workers: 1
+
+  # Backward-compatible alias if trajectory_workers is absent.
+  num_workers: 1
+
+  # Bulk extraction chunk size for internal-coordinate features.
+  feature_chunk_size: 250
+
+  # MDAnalysis distance backend. "serial" is safest.
+  distance_backend: "serial"
+
+  # Write a concatenated DCD for inspection. This can be slow and storage-heavy.
+  write_concat_dcd: false
+
+  # ---- CV selection and feature-space choice ----
+  # Empty list means save all columns from .colvars.traj.
+  # Provide names to keep only selected CVs.
+  cvs_to_save: []
+
+  # Backward-compatible alias used only if cvs_to_save is absent.
+  cvs_to_use: []
+
+  # If true, append sin/cos columns for saved CVs, treating CV values as degrees.
+  periodic: false
+
+  # RiteWeight and KMeans may use internal-coordinate features or CVs.
+  # If both riteweight_space and cluster_space are "cv", the saved features are CVs.
+  riteweight_space: "features"    # "features" or "cv"
+  cluster_space: "features"       # "features", "pca_highdim", "cv", "pca_cv"
+
+  # ---- Reweighting ----
+  # true uses RiteWeight-style trajectory reweighting.
+  # false assigns uniform normalized frame weights.
+  reweight: true
+
+  riteweight:
+    # Lag in saved frames used to build trajectory segments.
+    lag: 1
+
+    # Number of temporary random clusters for the RiteWeight transition matrix.
+    n_clusters: 100
+
+    # Maximum RiteWeight fixed-point iterations.
+    n_iter: 200
+
+    # Stop when L1 segment-weight change is below tol for tol_window iterations.
+    tol: 1.0e-6
+    tol_window: 5
+
+    # Average the last avg_last segment-weight estimates if available.
+    avg_last: 20
+
+    # Random seed for RiteWeight cluster-center selection.
+    seed: 2026
+
+  # Flat legacy aliases used only when the nested riteweight block omits a key.
+  lag: 1
+  rw_n_clusters: 100
+  rw_n_iter: 200
+  rw_tol: 1.0e-6
+  rw_tol_window: 5
+  rw_avg_last: 20
+  rw_seed: 2026
+
+  # ---- Metastable-state labeling ----
+  # "kmeans": cluster frames, then label far-from-centroid frames as -1.
+  # "user_defined_basins": assign labels from explicit CV boxes or cutoffs.
+  labeling_method: "kmeans"       # "kmeans" or "user_defined_basins"
+
+  # Standardize the chosen clustering matrix before PCA/KMeans.
+  standardize_features: true
+
+  # PCA dimension when cluster_space is pca_highdim or pca_cv.
+  pca_cluster_dim: 20
+
+  # If integer, use exactly this many states and skip elbow selection.
+  # null chooses k from kmin..kmax with elbow_method.
+  n_clusters: null
+
+  # Candidate k range for elbow selection.
+  kmin: 2
+  kmax: 12
+
+  # Elbow heuristic.
+  elbow_method: "knee"            # "knee" or "second_derivative"
+
+  # Within each KMeans cluster, frames farther than this distance quantile
+  # from their centroid are relabeled as intermediate (-1).
+  intermediate_quantile: 0.9
+
+  # KMeans reproducibility and initialization.
+  kmeans_random_state: 0
+  kmeans_n_init: "auto"
+
+  # Write elbow and labeling diagnostic plots when available.
+  write_diag_plots: true
+
+  # Project clusters/basins onto CVs and mark centers.
+  # For 3 CVs, one plot is written for each pair.
+  plot_kmeans_centroids: false
+  centroid_plot_cvs: ["CV1", "CV2"]
+
+  # ---- User-defined basin labeling ----
+  # Used only when labeling_method: "user_defined_basins".
+  # assignment_mode:
+  #   "box": basin has center and size; inside abs(x-center) <= size.
+  #   "distance_cutoff": basin has center and cutoff in Euclidean distance.
+  user_defined_basins:
+    cvs_to_label: ["CV1", "CV2"]
+    assignment_mode: "box"        # "box" or "distance_cutoff"
+    basins:
+      - label: 0
+        center: [0.0, 0.0]
+        size: [0.2, 0.2]
+      - label: 1
+        center: [1.0, 1.0]
+        size: [0.2, 0.2]
+    # Legacy two-basin shorthand, used only if basins is absent:
+    # basin_A: [0.0, 0.0]
+    # basin_B: [1.0, 1.0]
+    # basin_size: [0.2, 0.2]
+
+
+# ============================================================
+# 2. Next-Hit Committor Training
+# ============================================================
+NEXT_HIT_COMMITTOR:
+  # Dataset produced by TENSORQ_LABEL.
+  dataset_path: "./dataset_out/dataset.pt"
+
+  # Output directory and filename prefix.
+  out_dir: "./next_hit_train"
+  label: "next_hit_committor"
+
+  # Device. Falls back to CPU if CUDA is unavailable.
+  device: "cuda:0"
+
+  # Random seed for train/validation split and Torch/NumPy initialization.
+  seed: 0
+
+  # Use every Nth saved dataset frame for training.
+  dataset_stride: 1
+
+  # Model input space:
+  #   "features": use dataset features.
+  #   "cv": use saved dataset CVs and optional CV featurization below.
+  model_input_space: "features"   # aliases: input_space, feature_space
+
+  # CV model-input options used only when model_input_space: "cv".
+  # Empty cvs_to_use means all saved CV columns.
+  cvs_to_use: []
+  model_cvs: []                   # alias for cvs_to_use
+  periodic_cvs: false             # false, true for all selected CVs, or list of names
+  periodic_cv_units: "degrees"    # "degrees" or "radians"; alias: cv_units
+
+  # Lag in post-stride dataset frames for next-hit training pairs.
+  lag: 1
+  time_shift: 1                   # alias if lag is absent
+
+  # Whether lagged pairs may cross trajectory IDs when traj_id exists.
+  allow_cross_traj_pairs: false
+
+  # Filter lagged pairs by endpoint metastable labels:
+  #   "none": keep all valid lagged pairs.
+  #   "any": keep if either endpoint is labeled.
+  #   "both": keep if both endpoints are labeled.
+  require_labeled: "none"
+
+  # Train/validation split over lagged pairs.
+  val_ratio: 0.1
+
+  # DataLoader controls.
+  batch_size: 2048
+  num_workers: 0
+  prefetch_factor: 2
+  drop_last: false
+
+  # If true and CUDA is used, keep tensors resident on GPU to reduce CPU transfer.
+  gpu_resident_data: true
+
+  # Optimization.
+  epochs: 500
+  patience: 30
+  lr: 1.0e-3
+  learning_rate: 1.0e-3           # alias if lr is absent
+  weight_decay: 1.0e-6
+  use_amp: true
+
+  # Neural network.
+  model:
+    hidden: [256, 256, 128]
+    activation: "elu"             # "elu", "relu", "gelu", "silu", "tanh"
+    dropout: 0.0
+    batch_norm: false
+    output_normalization: "softmax"  # "softmax" or "positive_l1"
+    positive_eps: 1.0e-8
+    use_softmax_output: null      # legacy bool override; null means use output_normalization
+
+  # Flat model aliases used only when model.<key> is absent.
+  hidden: [256, 256, 128]
+  activation: "elu"
+  dropout: 0.0
+  batch_norm: false
+  output_normalization: "softmax"
+  positive_eps: 1.0e-8
+
+  # Loss terms.
+  loss:
+    # Dirichlet temporal smoothness weight.
+    lambda_dir: 1.0
+
+    # Boundary condition weight on labeled metastable endpoints.
+    lambda_bc: 10.0
+
+    # Flux-profile flatness/consistency weight.
+    lambda_flux: 0.1
+
+    # Boundary loss mode.
+    boundary_mode: "cross_entropy"  # "cross_entropy" or "mse"
+
+    # Weight samples in each loss term by dataset weights.
+    weighted_dirichlet: true
+    weighted_boundary: false
+    weighted_flux: true
+
+    # Flux threshold grid. Set thresholds to an explicit list to override.
+    thresholds: null
+    n_thresholds: 9
+    threshold_start: 0.1
+    threshold_stop: 0.9
+
+    # Smooth isocommittor crossing width.
+    flux_eps: 0.02
+
+    # Ordered flux pairs. null means all i -> j, i != j.
+    # Example: [[0, 1], [1, 2]]
+    adjacency: null
+    flux_pairs: null              # alias for adjacency
+    symmetric_adjacency: true
+
+    # Flux surface definition.
+    flux_surface: "qi_decrease"   # "qi_decrease" or "qj_increase"
+
+    # Physical/scaling options for Dirichlet or flux terms.
+    tau: 1.0
+    scale_dirichlet_by_tau: false
+    scale_flux_by_tau: false
+
+
+# ============================================================
+# 3. Next-Hit Committor Inference
+# ============================================================
+NEXT_HIT_INFER:
+  # Dataset and trained model/checkpoint.
+  dataset: "./dataset_out/dataset.pt"
+  dataset_path: "./dataset_out/dataset.pt"   # alias if dataset is absent
+  model: "./next_hit_train/next_hit_committor_best_checkpoint.pt"
+
+  # Output directory.
+  out_dir: "./next_hit_infer"
+
+  # Device and batching.
+  device: "cuda:0"
+  batch_size: 65536
+  dataset_stride: 1
+
+  # Optional explicit state count. null infers from dataset metadata.
+  n_states: null
+
+  # Model input-space options. If model is a checkpoint, missing values are
+  # filled from the checkpoint metadata.
+  model_input_space: "features"
+  cvs_to_use: []
+  periodic_cvs: false
+  periodic_cv_units: "degrees"
+
+  # Output controls.
+  save_csv: true
+  include_cv_in_csv: true
+  save_reactive_weights: true
+
+  # Probability row check tolerance.
+  normalization_atol: 1.0e-4
+
+
+# ============================================================
+# 4. Next-Hit Committor Plotting
+# ============================================================
+NEXT_HIT_PLOT:
+  # Dataset and either model or Q_npy.
+  dataset: "./dataset_out/dataset.pt"
+  dataset_path: "./dataset_out/dataset.pt"
+  model: "./next_hit_train/next_hit_committor_best_checkpoint.pt"
+  Q_npy: null
+  q_npy: null                     # alias for Q_npy
+
+  # Output directory and image format.
+  out_dir: "./next_hit_plots"
+  format: "png"
+
+  # Device/batching for model inference inside plotting.
+  device: "cuda:0"
+  prediction_device: "cuda:0"
+  batch_size: 65536
+  dataset_stride: 1
+
+  # State naming for legends.
+  n_states: null
+  state_names: null
+
+  # Model input-space options used when model is provided.
+  model_input_space: "features"
+  cvs_to_use: []
+  model_cvs: []
+  periodic_cvs: false
+  periodic_cv_units: "degrees"
+  cv_units: "degrees"
+
+  # CV planes to plot. Each plane can contain two or three saved CV names.
+  # 2D planes produce binned fields; 3D planes produce binned-center scatter plots.
+  planes: []
+
+  # 2D/3D plot binning and axis control. Committor-vector plots use
+  # sample-averaged bins; reaction tubes can evaluate at CV-bin centers.
+  bins: 60
+  # For a 3D plane, also write 2D projections by averaging out the omitted CV.
+  # Applies to both committor-vector plots and reaction-tube plots.
+  plot_3d_to_2d_projections: true
+  cmap: "RdBu_r"
+  same_axis_limits: false
+  equal_axis_limits: false
+  axis_limits: null
+  xlim: null
+  ylim: null
+  zlim: null
+
+  # Distribution plots.
+  distribution_bins: 60
+
+  # Basin overlays on CV projection plots.
+  plot_basin_overlay: true
+  basin_cmap: "tab10"
+  basin_overlay_alpha: 0.22
+  basin_overlay_max_points: 20000
+  basin_overlay_point_size: 10.0
+  basin_overlay_labels: true
+  basin_overlay_label_size: 8.0
+  basin_overlay_label_z_offset: 0.04
+  basin_overlay_legend: true
+
+  # 3D rendering controls.
+  max_3d_points: 50000
+  3d_alpha: 0.75
+  3d_point_size: 4.0
+  3d_weight_size_scale: 0.0
+  3d_depthshade: false
+  3d_elev: 24.0
+  3d_azim: -60.0
+
+  # Reaction-tube plots based on q_i(z) q_j(z).
+  plot_reaction_tubes: true
+  reaction_tube_pairs: null       # null means all unordered pairs
+  reaction_tube_threshold: null
+  reaction_tube_plot_threshold: null
+  reaction_tube_cmap: "magma"
+  reaction_tube_vmax: 0.25
+  reaction_tube_distribution_bins: 60
+  reaction_tube_max_3d_points: 50000
+  reaction_tube_3d_point_selection: "top"  # "top", "random", or "uniform"
+  reaction_tube_alpha: 0.75
+  reaction_tube_3d_alpha: 0.75
+
+  # Evaluate reaction tubes at CV-bin centers when possible.
+  # "auto" does this only when model_input_space is cv and the plane covers all model CVs.
+  reaction_tube_center_evaluate: "auto"  # "auto", true, or false
+  cv_center_fill_values: {}
+
+  # Reaction-tube network plots.
+  plot_reaction_tube_network: true
+  reaction_tube_network_cmap: "turbo"
+  reaction_tube_network_start_color: "white"
+  reaction_tube_network_alpha: 0.78
+  reaction_tube_network_3d_point_size: 4.0
+  reaction_tube_network_3d_alpha: 0.75
+
+  # Flux-profile diagnostics computed during plotting.
+  lag: 1
+  time_shift: 1
+  lag_reference: "original_frames" # "original_frames" or "strided_frames"
+  frame_time: null
+  time_unit: "frame"
+  allow_cross_traj_pairs: false
+  thresholds: null
+  n_thresholds: 9
+  threshold_start: 0.1
+  threshold_stop: 0.9
+  adjacency: null
+  flux_pairs: null
+  symmetric_adjacency: true
+  flux_eps: 0.02
+  divide_by_tau: false
+  flux_surface: "qi_decrease"
+  chunk_size: 20000
+  weighted_flux: true
+
+
+# ============================================================
+# 5. Next-Hit Rate Constant Estimation
+# ============================================================
+NEXT_HIT_RATE:
+  # Dataset plus one of model or Q_npy.
+  dataset: "./dataset_out/dataset.pt"
+  dataset_path: "./dataset_out/dataset.pt"
+  model: "./next_hit_train/next_hit_committor_best_checkpoint.pt"
+  Q_npy: null
+  q_npy: null
+
+  # Output directory.
+  out_dir: "./next_hit_rate"
+
+  # Device for model inference and flux accumulation.
+  device: "cuda:0"
+  flux_device: "cuda:0"
+  flux_dtype: null                # null, "float32", or "float64"
+  batch_size: 65536
+  dataset_stride: 1
+
+  # Optional explicit state count.
+  n_states: null
+
+  # Model input-space options when model is provided. Checkpoints can fill these.
+  model_input_space: "features"
+  cvs_to_use: []
+  periodic_cvs: false
+  periodic_cv_units: "degrees"
+
+  # Lag timing. By default, lag is in original saved dataset frames.
+  lag: 1
+  time_shift: 1
+  lag_reference: "original_frames" # "original_frames" or "strided_frames"
+  frame_time: null                 # physical time per saved frame; null uses frame units
+  time_unit: "frame"
+  allow_cross_traj_pairs: false
+
+  # Probability validation.
+  normalization_atol: 1.0e-4
+
+  # Flux-profile settings.
+  thresholds: null
+  n_thresholds: 9
+  threshold_start: 0.1
+  threshold_stop: 0.9
+  adjacency: null
+  flux_pairs: null
+  symmetric_adjacency: true
+  flux_eps: 0.02
+  divide_by_tau: true
+  flux_surface: "qi_decrease"
+  chunk_size: 20000
+  weighted_flux: true
+
+  # Population and transition-hit estimation.
+  pi_mode: "labels"               # "labels" or "soft"
+  weighted_hits: true
+  labeled_exits_only: false
+
+  # Error analysis. Direct weighted/counting standard errors are combined with
+  # standard deviations across contiguous lagged-pair slices.
+  error_analysis: true
+  error_n_slices: 10
+  error_min_pairs_per_slice: 1
+
+  # Plot outputs.
+  make_plots: true
+  plot_format: "png"
+
+
+# ============================================================
+# 6. Pair-Wise Committor Training
+# ============================================================
+PAIRWISE_COMMITTOR:
+  # Dataset produced by TENSORQ_LABEL. Pair labels are derived from meta_state.
+  dataset_path: "./dataset_out/dataset.pt"
+
+  # Output directory and filename prefix.
+  out_dir: "./pairwise_committor_train"
+  label: "pairwise_committor"
+
+  # Device and reproducibility.
+  device: "cuda:0"
+  seed: 0
+
+  # Dataset/frame controls.
+  dataset_stride: 1
+  lag: 1
+  allow_cross_traj_pairs: false
+
+  # Require pairwise endpoint labels on lagged endpoints:
+  #   "none": keep all pairs.
+  #   "any": at least one endpoint belongs to a state in a pair.
+  #   "both": both endpoints have at least one valid pairwise label.
+  require_labeled: "both"
+
+  # Model input space.
+  model_input_space: "features"
+  cvs_to_use: []
+  periodic_cvs: false
+  periodic_cv_units: "degrees"
+
+  # Split and loader.
+  val_ratio: 0.1
+  batch_size: 2048
+  num_workers: 0
+  prefetch_factor: 2
+  drop_last: false
+  gpu_resident_data: true
+
+  # Optimization.
+  epochs: 200
+  patience: 30
+  lr: 1.0e-3
+  weight_decay: 1.0e-6
+  use_amp: true
+
+  # Neural network.
+  model:
+    hidden: [256, 256, 128]
+    activation: "elu"             # "elu", "relu", "gelu", "silu", "tanh"
+    dropout: 0.0
+    batch_norm: false
+    output_activation: "sigmoid"  # "sigmoid" or "identity"
+
+  # Loss terms.
+  loss:
+    # Temporal smoothness for pair-wise committor columns.
+    lambda_dirichlet: 1.0
+    weighted_dirichlet: true
+
+    # Endpoint restraint weight from metastable labels.
+    lambda_endpoint: 100.0
+
+    weighted_endpoint: false
+
+
+# ============================================================
+# 7. Pair-Wise Committor Inference
+# ============================================================
+PAIRWISE_INFER:
+  # Dataset and trained pair-wise model/checkpoint.
+  dataset: "./dataset_out/dataset.pt"
+  dataset_path: "./dataset_out/dataset.pt"
+  model: "./pairwise_committor_train/pairwise_committor_best_checkpoint.pt"
+
+  # Output directory.
+  out_dir: "./pairwise_committor_infer"
+
+  # Device and batching.
+  device: "cuda:0"
+  batch_size: 65536
+  dataset_stride: 1
+
+  # Optional explicit state count.
+  n_states: null
+
+  # Model input-space options. Checkpoints can fill missing values.
+  model_input_space: "features"
+  cvs_to_use: []
+  periodic_cvs: false
+  periodic_cv_units: "degrees"
+
+  # Reconstruction from pair-wise Q_ij columns to state probabilities P_j.
+  anchor_state: 0
+  eps: 1.0e-4
+  reconstruct_chunk: 20000
+
+  # Output controls.
+  save_csv: true
+  include_cv_in_csv: true
+  normalization_atol: 1.0e-4
+
+
+# ============================================================
+# 8. Pair-Wise Committor Plotting
+# ============================================================
+PAIRWISE_PLOT:
+  # Dataset and either model or Q_npy.
+  dataset: "./dataset_out/dataset.pt"
+  dataset_path: "./dataset_out/dataset.pt"
+  model: "./pairwise_committor_train/pairwise_committor_best_checkpoint.pt"
+  Q_npy: null
+  q_npy: null
+
+  # Output directory and format.
+  out_dir: "./pairwise_committor_plots"
+  format: "png"
+
+  # Device/batching for model inference.
+  device: "cuda:0"
+  prediction_device: "cuda:0"
+  batch_size: 65536
+  dataset_stride: 1
+
+  # Optional explicit state count.
+  n_states: null
+
+  # Model input-space options.
+  model_input_space: "features"
+  cvs_to_use: []
+  periodic_cvs: false
+  periodic_cv_units: "degrees"
+
+  # Reconstruction from pair-wise Q to state probabilities P.
+  anchor_state: 0
+  eps: 1.0e-4
+  reconstruct_chunk: 20000
+
+  # Distribution plots.
+  distribution_bins: 60
+
+  # Pair-wise plotting supports 2D CV planes and 3D CV point fields.
+  planes: []
+  bins: 60
+  same_axis_limits: false
+  equal_axis_limits: false
+  axis_limits: null
+  xlim: null
+  ylim: null
+  zlim: null
+
+  # 3D field controls used for planes with three CV names.
+  max_3d_points: 50000
+  3d_point_size: 4.0
+  3d_alpha: 0.75
+  3d_depthshade: false
+  3d_weight_size_scale: 0.0
+  3d_elev: 24.0
+  3d_azim: -60.0
+
+  # Colormaps for Q_ij and reconstructed P_j fields.
+  Q_cmap: "RdBu_r"
+  P_cmap: "viridis"
+
+
+# ============================================================
+# 9. Pair-Wise Rate Constant Estimation
+# ============================================================
+PAIRWISE_RATE:
+  # Dataset plus one of model, Q_npy, or P_npy.
+  dataset: "./dataset_out/dataset.pt"
+  dataset_path: "./dataset_out/dataset.pt"
+  model: "./pairwise_committor_train/pairwise_committor_best_checkpoint.pt"
+  Q_npy: null
+  q_npy: null
+  P_npy: null
+  p_npy: null
+
+  # Output directory.
+  out_dir: "./pairwise_committor_rate"
+
+  # Device/batching for model inference.
+  device: "cuda:0"
+  batch_size: 65536
+  dataset_stride: 1
+
+  # Optional explicit state count.
+  n_states: null
+
+  # Model input-space options when model is provided.
+  model_input_space: "features"
+  cvs_to_use: []
+  periodic_cvs: false
+  periodic_cv_units: "degrees"
+
+  # Reconstruction from pair-wise Q to state probabilities P.
+  anchor_state: 0
+  eps: 1.0e-4
+  reconstruct_chunk: 20000
+  normalization_atol: 1.0e-4
+
+  # Lag timing. By default, lag is in original saved dataset frames.
+  lag: 1
+  time_shift: 1
+  lag_reference: "original_frames" # "original_frames" or "strided_frames"
+  frame_time: null
+  time_unit: "frame"
+  allow_cross_traj_pairs: false
+
+  # Flux-profile settings.
+  thresholds: null
+  n_thresholds: 9
+  threshold_start: 0.1
+  threshold_stop: 0.9
+  adjacency: null
+  flux_pairs: null
+  symmetric_adjacency: true
+  flux_eps: 0.02
+  divide_by_tau: true
+  flux_surface: "qi_decrease"
+  chunk_size: 20000
+  weighted_flux: true
+
+  # Population estimate for k_ij = J_ij / pi_i.
+  pi_mode: "labels"               # "labels" or "soft"
+
+  # Plot outputs.
+  make_plots: true
+  plot_format: "png"

@@ -93,6 +93,8 @@ NEXT_HIT_RATE:
   n_thresholds: 9
   flux_eps: 0.02
   divide_by_tau: true
+  error_analysis: true
+  error_n_slices: 10
 
 PAIRWISE_COMMITTOR:
   dataset_path: "./dataset_out/dataset.pt"
@@ -105,6 +107,8 @@ PAIRWISE_COMMITTOR:
   val_ratio: 0.1
   require_labeled: "both"
   batch_size: 2048
+  prefetch_factor: 2
+  gpu_resident_data: true
   epochs: 200
   patience: 30
   lr: 1.0e-3
@@ -117,6 +121,7 @@ PAIRWISE_COMMITTOR:
     output_activation: "sigmoid"
   loss:
     lambda_dirichlet: 1.0
+    weighted_dirichlet: true
     lambda_endpoint: 100.0
 
 PAIRWISE_INFER:

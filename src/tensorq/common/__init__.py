@@ -1,1 +1,1 @@
-"""Shared TensorQ config, dataset, and flux helpers."""
+"""Shared TensorQ config, dataset, and rate/committor helpers."""

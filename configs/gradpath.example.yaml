@@ -1,0 +1,92 @@
+GRADPATH:
+  dataset: ./next_hit_dataset.pt
+  model: ./next_hit_model.pt
+  # Outputs are written under out_dir/state_i_j by default, e.g.
+  # ./gradpath_out/state_0_1 for the channel below.
+  out_dir: ./gradpath_out
+  use_channel_subdir: true
+
+  # ------- Manual single-pair mode (used by scripts/gradpath.py) -------
+  # Direct transition channel i -> j is selected with q_i * q_j >= threshold.
+  state_i: 0
+  state_j: 1
+  threshold: 0.20
+  max_points: 100
+  seed: 30
+
+  # ------- Automatic multi-pair mode (used by scripts/grad_state_p.py) -------
+  # Reads P_jump.csv from rate_constant.py output and automatically runs
+  # gradpath for every state pair with P_jump[i,j] > prob_threshold.
+  # Results are saved under out_dir/state_i_j/.
+  # p_jump: ./rate_out/P_jump.csv
+  # prob_threshold: 0.05
+  # max_pairs:             # optional: limit to top-N pairs by probability
+
+  # Per-state basin centers used as shooting endpoints in multi-pair mode.
+  # Same format as label.py's user_defined_basins — one entry per state.
+  # state_endpoints:
+  #   cvs_to_label: [cv_0, cv_1]
+  #   basins:
+  #     - label: 0
+  #       center: [-1.0, 0.0]
+  #     - label: 1
+  #       center: [ 1.0, 0.0]
+  #     - label: 2
+  #       center: [ 0.0, 1.0]
+
+  # FEL/KDE initial-point selection. In fel_kde mode, q_i*q_j is evaluated on
+  # KDE-smoothed CV-bin centers, thresholded, clustered in CV space, then each
+  # cluster contributes fel_points_per_cluster centers sampled by KDE weight.
+  # Set fel_n_clusters when the active q_i*q_j region has a known number of
+  # separated channels; otherwise an elbow rule is used.
+  selection_mode: fel_kde
+  fel_n_clusters:
+  fel_points_per_cluster: 5
+  fel_selection_method: weighted
+  fel_selection_power: 0.0
+  F_max: 12.0
+
+  # Use the same model input convention as next-hit inference/training.
+  # If model_input_space is cv and the model CVs are nonperiodic, saved paths
+  # can be interpreted directly as CV pathways.
+  model_input_space: cv
+  cvs_to_use: [cv_0, cv_1]
+
+  # Gradient shooting.
+  device: cuda:0
+  dtype: float32
+  step_size: 0.05
+  max_steps: 300
+  target_q: 0.98
+  num_images: 50
+  # Optional manually selected endpoints in the model input coordinates.
+  # endpoint_i: [-1.0, 0.0]
+  # endpoint_j: [1.0, 0.0]
+  smooth_iterations: 2
+  smooth_window: 5
+  reparameterize_after_smoothing: true
+  # Leave null to integrate all selected points in one CUDA batch. Set this
+  # when selected points * max_steps * dimensions is too large for GPU memory.
+  integration_batch_size:
+  normalize_gradient: true
+  noise_scale: 0.0
+
+  # Weighted pathway clustering.
+  cluster_distance_threshold: 0.25
+
+  # Plot selected channel points, the path dendrogram, and paths on this plane.
+  save_plots: true
+  plot_axes: [cv_0, cv_1]
+
+  # Separate plotting-only script:
+  #   python scripts/gradpath_plot.py --config configs/gradpath.example.yaml
+  # It plots only saved pathways, colored by q_i*q_j, without grey single
+  # shooting paths. Grey points are all sampled dataset points. Use center,
+  # medoid, or all for pathways.
+  plot_path_kind: center
+  plot_dataset_points: true
+  plot_dataset_max_points: 0
+  dataset_point_size: 4
+  dataset_point_alpha: 0.18
+  colored_path_cmap: viridis
+  colored_path_plot: center_paths_qiqj_colored.png

@@ -27,12 +27,66 @@ from .rate_constant import estimate_flux_profiles, resolve_lag_timing
 
 
 def weighted_mean_2d(x, y, v, w, xedges, yedges):
-    denom, _, _ = np.histogram2d(x, y, bins=[xedges, yedges], weights=w)
-    numer, _, _ = np.histogram2d(x, y, bins=[xedges, yedges], weights=w * v)
+    avg, _ = weighted_mean_nd([x, y], v, w, [xedges, yedges])
+    return avg
+
+
+def weighted_mean_nd(coords: list[np.ndarray], v: np.ndarray, w: np.ndarray, edges: list[np.ndarray]):
+    samples = np.column_stack(coords)
+    denom, _ = np.histogramdd(samples, bins=edges, weights=w)
+    numer, _ = np.histogramdd(samples, bins=edges, weights=w * v)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        avg = numer / denom
+    avg[denom <= 0] = np.nan
+    return avg, denom
+
+
+def bin_centers(edges: np.ndarray) -> np.ndarray:
+    return 0.5 * (edges[:-1] + edges[1:])
+
+
+def binned_field_points_3d(
+    field: np.ndarray,
+    denom: np.ndarray,
+    xedges: np.ndarray,
+    yedges: np.ndarray,
+    zedges: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    xcenters = bin_centers(xedges)
+    ycenters = bin_centers(yedges)
+    zcenters = bin_centers(zedges)
+    Xc, Yc, Zc = np.meshgrid(xcenters, ycenters, zcenters, indexing="ij")
+    mask = np.isfinite(field) & (denom > 0.0)
+    return Xc[mask], Yc[mask], Zc[mask], field[mask], denom[mask]
+
+
+def collapse_binned_field(field: np.ndarray, denom: np.ndarray, axis: int) -> np.ndarray:
+    valid = np.isfinite(field) & (denom > 0.0)
+    numer = np.where(valid, field * denom, 0.0).sum(axis=axis)
+    collapsed_denom = np.where(valid, denom, 0.0).sum(axis=axis)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        collapsed = numer / collapsed_denom
+    collapsed[collapsed_denom <= 0.0] = np.nan
+    return collapsed
+
+
+def average_binned_field(field: np.ndarray, axis: int) -> np.ndarray:
+    valid = np.isfinite(field)
+    denom = valid.sum(axis=axis)
+    numer = np.where(valid, field, 0.0).sum(axis=axis)
     with np.errstate(divide="ignore", invalid="ignore"):
         avg = numer / denom
     avg[denom <= 0] = np.nan
     return avg
+
+
+def destination_field_from_q_fields(fields: list[np.ndarray]) -> np.ndarray:
+    stack = np.stack(fields, axis=0)
+    valid = np.any(np.isfinite(stack), axis=0)
+    filled = np.where(np.isfinite(stack), stack, -np.inf)
+    dest = np.argmax(filled, axis=0).astype(float)
+    dest[~valid] = np.nan
+    return dest
 
 
 def state_names_for_plot(config: dict[str, Any], n_states: int) -> list[str]:
@@ -175,18 +229,27 @@ def selected_model_cvs(config: dict[str, Any], cv_headers: list[str]) -> list[st
 
 
 def should_center_evaluate_reaction_tube(config: dict[str, Any], plane: list[str], cv_headers: list[str]) -> bool:
-    mode = str(config.get("reaction_tube_center_evaluate", "auto")).lower()
+    return should_center_evaluate_cv_grid(config, plane, cv_headers, "reaction_tube_center_evaluate")
+
+
+def should_center_evaluate_cv_grid(
+    config: dict[str, Any],
+    plane: list[str],
+    cv_headers: list[str],
+    mode_key: str,
+) -> bool:
+    mode = str(config.get(mode_key, "auto")).lower()
     if mode in {"false", "no", "off", "0"}:
         return False
     if model_input_space(config) not in {"cv", "cvs", "colvars"}:
         if mode in {"true", "yes", "on", "1"}:
-            raise ValueError("reaction_tube_center_evaluate=true requires model_input_space='cv'.")
+            raise ValueError(f"{mode_key}=true requires model_input_space='cv'.")
         return False
     model_cvs = selected_model_cvs(config, cv_headers)
     covered = set(model_cvs).issubset(set(plane))
     if mode in {"true", "yes", "on", "1"} and not covered:
         raise ValueError(
-            "reaction_tube_center_evaluate=true requires the plotted plane to contain all model CVs: "
+            f"{mode_key}=true requires the plotted plane to contain all model CVs: "
             f"missing {sorted(set(model_cvs) - set(plane))}"
         )
     return covered
@@ -248,7 +311,9 @@ def select_reaction_tube_points(
     max_points: int,
     mode: str,
 ) -> np.ndarray:
-    mask = np.ones_like(tube, dtype=bool) if threshold is None else tube > float(threshold)
+    mask = np.isfinite(tube)
+    if threshold is not None:
+        mask &= tube > float(threshold)
     ids = np.flatnonzero(mask)
     max_points = int(max_points)
     if max_points <= 0 or ids.size <= max_points:
@@ -563,6 +628,62 @@ def scatter_3d_field(
     plt.close(fig)
 
 
+def plot_2d_field(
+    field: np.ndarray,
+    xedges: np.ndarray,
+    yedges: np.ndarray,
+    *,
+    labels: tuple[str, str],
+    title: str,
+    color_label: str,
+    out_path: str,
+    cmap: str,
+    vmin: float | None,
+    vmax: float | None,
+) -> None:
+    fig, ax = plt.subplots(figsize=(4.6, 3.8), dpi=160)
+    pcm = ax.pcolormesh(xedges, yedges, field.T, cmap=cmap, shading="auto", vmin=vmin, vmax=vmax)
+    ax.set_xlabel(str(labels[0]))
+    ax.set_ylabel(str(labels[1]))
+    ax.set_title(title)
+    cb = fig.colorbar(pcm, ax=ax)
+    cb.set_label(color_label)
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def plot_reaction_tube_2d_field(
+    field: np.ndarray,
+    xedges: np.ndarray,
+    yedges: np.ndarray,
+    *,
+    x: np.ndarray,
+    y: np.ndarray,
+    basin_state: np.ndarray,
+    n_states: int,
+    labels: tuple[str, str],
+    title: str,
+    color_label: str,
+    out_path: str,
+    cmap: str,
+    vmin: float | None,
+    vmax: float | None,
+    config: dict[str, Any],
+) -> None:
+    fig, ax = plt.subplots(figsize=(4.6, 3.8), dpi=160)
+    add_basin_overlay_2d(ax, x, y, basin_state, xedges, yedges, n_states, config)
+    pcm = ax.pcolormesh(xedges, yedges, field.T, cmap=cmap, shading="auto", vmin=vmin, vmax=vmax)
+    ax.set_xlabel(str(labels[0]))
+    ax.set_ylabel(str(labels[1]))
+    ax.set_title(title)
+    cb = fig.colorbar(pcm, ax=ax)
+    cb.set_label(color_label)
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
 def load_q(config: dict[str, Any], pack, n_states: int) -> np.ndarray:
     q_path = config.get("Q_npy", config.get("q_npy", None))
     if q_path is not None:
@@ -620,6 +741,17 @@ def cv_points_from_plane(
     for name, values in zip(plane, plane_values):
         points[:, cv_headers.index(name)] = values.astype(np.float32)
     return points
+
+
+def cv_center_grid(
+    axis_limits: list[tuple[float, float]],
+    bins: int,
+) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
+    edges = [np.linspace(lo, hi, bins + 1) for lo, hi in axis_limits]
+    centers = [bin_centers(edge) for edge in edges]
+    meshes = list(np.meshgrid(*centers, indexing="ij"))
+    flat_values = [mesh.ravel() for mesh in meshes]
+    return edges, meshes, flat_values
 
 
 def plot_q_distributions(q: np.ndarray, weights: np.ndarray, out_path: str, state_names=None, bins: int = 60) -> None:
@@ -722,16 +854,40 @@ def plot_cv_fields(config: dict[str, Any], pack, q: np.ndarray, weights: np.ndar
             ix, iy, iz = cv_headers.index(cvx), cv_headers.index(cvy), cv_headers.index(cvz)
             x, y, z = cv[:, ix], cv[:, iy], cv[:, iz]
             axis_limits = resolve_cv_axis_limits([x, y, z], config)
+            (xmin, xmax), (ymin, ymax), (zmin, zmax) = axis_limits
+            xedges = np.linspace(xmin, xmax, bins + 1)
+            yedges = np.linspace(ymin, ymax, bins + 1)
+            zedges = np.linspace(zmin, zmax, bins + 1)
             subdir = ensure_dir(os.path.join(out_dir, f"{cvx}__{cvy}__{cvz}"))
+            plot_2d_projections = bool(config.get("plot_3d_to_2d_projections", True))
+            collapsed_planes = [
+                (cvx, cvy, cvz, xedges, yedges, 2),
+                (cvx, cvz, cvy, xedges, zedges, 1),
+                (cvy, cvz, cvx, yedges, zedges, 0),
+            ]
+            collapsed_q_fields = {item[-1]: [] for item in collapsed_planes}
+            q_fields_3d = []
+            field_weights_3d = None
 
             for j in range(q.shape[1]):
+                field, denom = weighted_mean_nd([x, y, z], q[:, j], weights, [xedges, yedges, zedges])
+                if field_weights_3d is None:
+                    field_weights_3d = denom
+                q_fields_3d.append(field)
+                plot_x, plot_y, plot_z, plot_values, plot_weights = binned_field_points_3d(
+                    field,
+                    denom,
+                    xedges,
+                    yedges,
+                    zedges,
+                )
                 path = os.path.join(subdir, f"q_{j}__{cvx}__{cvy}__{cvz}.{fmt}")
                 scatter_3d_field(
-                    x,
-                    y,
-                    z,
-                    q[:, j],
-                    weights=weights,
+                    plot_x,
+                    plot_y,
+                    plot_z,
+                    plot_values,
+                    weights=plot_weights,
                     labels=(cvx, cvy, cvz),
                     title=f"q_{j}",
                     color_label=f"q_{j}",
@@ -743,15 +899,40 @@ def plot_cv_fields(config: dict[str, Any], pack, q: np.ndarray, weights: np.ndar
                     axis_limits=axis_limits,
                 )
                 saved.append(path)
+                if plot_2d_projections:
+                    for xlab, ylab, averaged_label, xproj_edges, yproj_edges, axis in collapsed_planes:
+                        projected = collapse_binned_field(field, denom, axis=axis)
+                        collapsed_q_fields[axis].append(projected)
+                        path = os.path.join(subdir, f"q_{j}__{xlab}__{ylab}__avg_{averaged_label}.{fmt}")
+                        plot_2d_field(
+                            projected,
+                            xproj_edges,
+                            yproj_edges,
+                            labels=(xlab, ylab),
+                            title=f"q_{j} averaged over {averaged_label}",
+                            color_label=f"q_{j}",
+                            out_path=path,
+                            cmap=cmap,
+                            vmin=0.0,
+                            vmax=1.0,
+                        )
+                        saved.append(path)
 
-            dest = np.argmax(q, axis=1).astype(float)
+            dest = destination_field_from_q_fields(q_fields_3d)
+            plot_x, plot_y, plot_z, plot_values, plot_weights = binned_field_points_3d(
+                dest,
+                field_weights_3d,
+                xedges,
+                yedges,
+                zedges,
+            )
             path = os.path.join(subdir, f"destination__{cvx}__{cvy}__{cvz}.{fmt}")
             scatter_3d_field(
-                x,
-                y,
-                z,
-                dest,
-                weights=weights,
+                plot_x,
+                plot_y,
+                plot_z,
+                plot_values,
+                weights=plot_weights,
                 labels=(cvx, cvy, cvz),
                 title="argmax_j q_j",
                 color_label="destination",
@@ -763,6 +944,23 @@ def plot_cv_fields(config: dict[str, Any], pack, q: np.ndarray, weights: np.ndar
                 axis_limits=axis_limits,
             )
             saved.append(path)
+            if plot_2d_projections:
+                for xlab, ylab, averaged_label, xproj_edges, yproj_edges, axis in collapsed_planes:
+                    projected_dest = destination_field_from_q_fields(collapsed_q_fields[axis])
+                    path = os.path.join(subdir, f"destination__{xlab}__{ylab}__avg_{averaged_label}.{fmt}")
+                    plot_2d_field(
+                        projected_dest,
+                        xproj_edges,
+                        yproj_edges,
+                        labels=(xlab, ylab),
+                        title=f"argmax_j q_j averaged over {averaged_label}",
+                        color_label="destination",
+                        out_path=path,
+                        cmap="tab20",
+                        vmin=0.0,
+                        vmax=float(max(1, q.shape[1] - 1)),
+                    )
+                    saved.append(path)
             continue
 
         cvx, cvy = plane
@@ -773,34 +971,39 @@ def plot_cv_fields(config: dict[str, Any], pack, q: np.ndarray, weights: np.ndar
         yedges = np.linspace(ymin, ymax, bins + 1)
         subdir = ensure_dir(os.path.join(out_dir, f"{cvx}__{cvy}"))
 
+        q_fields = []
         for j in range(q.shape[1]):
             field = weighted_mean_2d(x, y, q[:, j], weights, xedges, yedges)
-            fig, ax = plt.subplots(figsize=(4.6, 3.8), dpi=160)
-            pcm = ax.pcolormesh(xedges, yedges, field.T, cmap=cmap, shading="auto", vmin=0.0, vmax=1.0)
-            ax.set_xlabel(str(cvx))
-            ax.set_ylabel(str(cvy))
-            ax.set_title(f"q_{j}")
-            cb = fig.colorbar(pcm, ax=ax)
-            cb.set_label(f"q_{j}")
-            fig.tight_layout()
+            q_fields.append(field)
             path = os.path.join(subdir, f"q_{j}__{cvx}__{cvy}.{fmt}")
-            fig.savefig(path)
-            plt.close(fig)
+            plot_2d_field(
+                field,
+                xedges,
+                yedges,
+                labels=(cvx, cvy),
+                title=f"q_{j}",
+                color_label=f"q_{j}",
+                out_path=path,
+                cmap=cmap,
+                vmin=0.0,
+                vmax=1.0,
+            )
             saved.append(path)
 
-        dest = np.argmax(q, axis=1).astype(float)
-        field = weighted_mean_2d(x, y, dest, weights, xedges, yedges)
-        fig, ax = plt.subplots(figsize=(4.6, 3.8), dpi=160)
-        pcm = ax.pcolormesh(xedges, yedges, field.T, cmap="tab20", shading="auto", vmin=0, vmax=max(1, q.shape[1] - 1))
-        ax.set_xlabel(str(cvx))
-        ax.set_ylabel(str(cvy))
-        ax.set_title("argmax_j q_j")
-        cb = fig.colorbar(pcm, ax=ax)
-        cb.set_label("destination")
-        fig.tight_layout()
+        field = destination_field_from_q_fields(q_fields)
         path = os.path.join(subdir, f"destination__{cvx}__{cvy}.{fmt}")
-        fig.savefig(path)
-        plt.close(fig)
+        plot_2d_field(
+            field,
+            xedges,
+            yedges,
+            labels=(cvx, cvy),
+            title="argmax_j q_j",
+            color_label="destination",
+            out_path=path,
+            cmap="tab20",
+            vmin=0.0,
+            vmax=float(max(1, q.shape[1] - 1)),
+        )
         saved.append(path)
 
     return saved
@@ -861,64 +1064,101 @@ def plot_reaction_tube_fields(
             axis_limits = resolve_cv_axis_limits([x, y, z], config)
             subdir = ensure_dir(os.path.join(out_dir, f"{cvx}__{cvy}__{cvz}", "reaction_tubes"))
 
+            (xedges, yedges, zedges), (Xc, Yc, Zc), flat_center_values = cv_center_grid(axis_limits, bins)
+            plot_x, plot_y, plot_z = Xc.ravel(), Yc.ravel(), Zc.ravel()
+            plot_2d_projections = bool(config.get("plot_3d_to_2d_projections", True))
+            projected_planes = [
+                (cvx, cvy, cvz, xedges, yedges, 2, x, y),
+                (cvx, cvz, cvy, xedges, zedges, 1, x, z),
+                (cvy, cvz, cvx, yedges, zedges, 0, y, z),
+            ]
+
             center_eval = should_center_evaluate_reaction_tube(config, plane, cv_headers) and center_model is not None
             if center_eval:
-                (xmin, xmax), (ymin, ymax), (zmin, zmax) = axis_limits
-                xcenters = 0.5 * (np.linspace(xmin, xmax, bins + 1)[:-1] + np.linspace(xmin, xmax, bins + 1)[1:])
-                ycenters = 0.5 * (np.linspace(ymin, ymax, bins + 1)[:-1] + np.linspace(ymin, ymax, bins + 1)[1:])
-                zcenters = 0.5 * (np.linspace(zmin, zmax, bins + 1)[:-1] + np.linspace(zmin, zmax, bins + 1)[1:])
-                Xc, Yc, Zc = np.meshgrid(xcenters, ycenters, zcenters, indexing="ij")
-                center_points = cv_points_from_plane(
-                    plane,
-                    [Xc.ravel(), Yc.ravel(), Zc.ravel()],
-                    cv_headers,
-                    config,
-                )
+                center_points = cv_points_from_plane(plane, flat_center_values, cv_headers, config)
                 model, device = center_model
                 q_centers = predict_q_at_cv_points(config, center_points, cv_headers, model, device)
-                plot_x, plot_y, plot_z = Xc.ravel(), Yc.ravel(), Zc.ravel()
+                q_grid = q_centers.reshape((bins, bins, bins, q.shape[1]))
             else:
-                q_centers = q
-                plot_x, plot_y, plot_z = x, y, z
+                q_grid = None
 
             network_points = []
+            projected_network_fields = {item[5]: [] for item in projected_planes}
+            projected_network_pairs = {item[5]: [] for item in projected_planes}
             for i, j in pairs:
                 if i == j or i < 0 or j < 0 or i >= q.shape[1] or j >= q.shape[1]:
                     raise ValueError(f"Invalid reaction_tube pair {(i, j)} for n_states={q.shape[1]}.")
-                tube = q_centers[:, i] * q_centers[:, j]
+                if center_eval:
+                    tube_field = q_grid[:, :, :, i] * q_grid[:, :, :, j]
+                    field_weights = np.ones_like(tube_field, dtype=np.float64)
+                else:
+                    tube = q[:, i] * q[:, j]
+                    tube_field, field_weights = weighted_mean_nd([x, y, z], tube, weights, [xedges, yedges, zedges])
+                if plot_threshold is not None:
+                    tube_field = tube_field.copy()
+                    tube_field[tube_field <= plot_threshold] = np.nan
+                tube_values = tube_field.ravel()
                 ids = select_reaction_tube_points(
-                    tube,
-                    threshold=plot_threshold,
+                    tube_values,
+                    threshold=None,
                     max_points=reaction_tube_max_points,
                     mode=reaction_tube_selection,
                 )
-                if ids.size == 0:
-                    continue
-                if plot_network:
-                    network_points.append(((i, j), plot_x[ids], plot_y[ids], plot_z[ids]))
-                path = os.path.join(subdir, f"tube_{i}_{j}__{cvx}__{cvy}__{cvz}.{fmt}")
-                scatter_3d_field(
-                    plot_x[ids],
-                    plot_y[ids],
-                    plot_z[ids],
-                    tube[ids],
-                    weights=np.ones(ids.size, dtype=np.float64),
-                    labels=(cvx, cvy, cvz),
-                    title=f"q_{i} q_{j}",
-                    color_label=f"q_{i}(z) q_{j}(z)",
-                    out_path=path,
-                    cmap=cmap,
-                    vmin=0.0,
-                    vmax=vmax,
-                    config=config,
-                    axis_limits=axis_limits,
-                    max_points=0,
-                    alpha=reaction_tube_3d_alpha,
-                    basin_xyz=(x, y, z),
-                    basin_state=basin_state,
-                    n_states=n_states,
-                )
-                saved.append(path)
+                if ids.size > 0:
+                    if plot_network:
+                        network_points.append(((i, j), plot_x[ids], plot_y[ids], plot_z[ids]))
+                    path = os.path.join(subdir, f"tube_{i}_{j}__{cvx}__{cvy}__{cvz}.{fmt}")
+                    scatter_3d_field(
+                        plot_x[ids],
+                        plot_y[ids],
+                        plot_z[ids],
+                        tube_values[ids],
+                        weights=np.ones(ids.size, dtype=np.float64),
+                        labels=(cvx, cvy, cvz),
+                        title=f"q_{i} q_{j}",
+                        color_label=f"q_{i}(z) q_{j}(z)",
+                        out_path=path,
+                        cmap=cmap,
+                        vmin=0.0,
+                        vmax=vmax,
+                        config=config,
+                        axis_limits=axis_limits,
+                        max_points=0,
+                        alpha=reaction_tube_3d_alpha,
+                        basin_xyz=(x, y, z),
+                        basin_state=basin_state,
+                        n_states=n_states,
+                    )
+                    saved.append(path)
+                if plot_2d_projections:
+                    for xlab, ylab, averaged_label, xproj_edges, yproj_edges, axis, raw_x, raw_y in projected_planes:
+                        projected = (
+                            average_binned_field(tube_field, axis=axis)
+                            if center_eval
+                            else collapse_binned_field(tube_field, field_weights, axis=axis)
+                        )
+                        if plot_network:
+                            projected_network_fields[axis].append(projected)
+                            projected_network_pairs[axis].append((i, j))
+                        path = os.path.join(subdir, f"tube_{i}_{j}__{xlab}__{ylab}__avg_{averaged_label}.{fmt}")
+                        plot_reaction_tube_2d_field(
+                            projected,
+                            xproj_edges,
+                            yproj_edges,
+                            x=raw_x,
+                            y=raw_y,
+                            basin_state=basin_state,
+                            n_states=n_states,
+                            labels=(xlab, ylab),
+                            title=f"q_{i} q_{j} averaged over {averaged_label}",
+                            color_label=f"q_{i}(z) q_{j}(z)",
+                            out_path=path,
+                            cmap=cmap,
+                            vmin=0.0,
+                            vmax=vmax,
+                            config=config,
+                        )
+                        saved.append(path)
             if plot_network:
                 network_path = os.path.join(subdir, f"reactive_network__{cvx}__{cvy}__{cvz}.{fmt}")
                 if plot_reaction_tube_network_3d(
@@ -932,6 +1172,23 @@ def plot_reaction_tube_fields(
                     n_states=n_states,
                 ):
                     saved.append(network_path)
+                if plot_2d_projections:
+                    for xlab, ylab, averaged_label, xproj_edges, yproj_edges, axis, raw_x, raw_y in projected_planes:
+                        network_path = os.path.join(subdir, f"reactive_network__{xlab}__{ylab}__avg_{averaged_label}.{fmt}")
+                        if plot_reaction_tube_network_2d(
+                            projected_network_fields[axis],
+                            projected_network_pairs[axis],
+                            x=raw_x,
+                            y=raw_y,
+                            basin_state=basin_state,
+                            xedges=xproj_edges,
+                            yedges=yproj_edges,
+                            n_states=n_states,
+                            labels=(xlab, ylab),
+                            out_path=network_path,
+                            config=config,
+                        ):
+                            saved.append(network_path)
             continue
 
         cvx, cvy = plane

@@ -34,14 +34,81 @@ class TrainState:
     best_epoch: int = -1
 
 
-def make_loader(dataset, batch_size: int, shuffle: bool, num_workers: int, device_type: str, drop_last: bool) -> DataLoader:
+class GpuPairwiseLaggedBatcher:
+    def __init__(
+        self,
+        features: torch.Tensor,
+        weights: torch.Tensor,
+        pair_labels: torch.Tensor,
+        idx_t: torch.Tensor,
+        idx_tau: torch.Tensor,
+        subset_indices: np.ndarray,
+        *,
+        batch_size: int,
+        shuffle: bool,
+        drop_last: bool = False,
+    ):
+        self.features = features
+        self.weights = weights
+        self.pair_labels = pair_labels
+        ids = torch.as_tensor(subset_indices, dtype=torch.long, device=idx_t.device)
+        self.idx_t = idx_t[ids].contiguous()
+        self.idx_tau = idx_tau[ids].contiguous()
+        self.batch_size = int(batch_size)
+        self.shuffle = bool(shuffle)
+        self.drop_last = bool(drop_last)
+
+    def __len__(self) -> int:
+        n = int(self.idx_t.numel())
+        if self.drop_last:
+            return n // self.batch_size
+        return int(np.ceil(n / max(1, self.batch_size)))
+
+    def __iter__(self):
+        n = int(self.idx_t.numel())
+        if self.shuffle:
+            order = torch.randperm(n, device=self.idx_t.device)
+        else:
+            order = torch.arange(n, device=self.idx_t.device)
+        stop = (n // self.batch_size) * self.batch_size if self.drop_last else n
+        for start in range(0, stop, self.batch_size):
+            batch_order = order[start : start + self.batch_size]
+            if batch_order.numel() == 0 or (self.drop_last and batch_order.numel() < self.batch_size):
+                continue
+            i = self.idx_t[batch_order]
+            j = self.idx_tau[batch_order]
+            yield {
+                "z_t": self.features[i],
+                "z_tau": self.features[j],
+                "weight": self.weights[i],
+                "pair_label_t": self.pair_labels[i],
+                "pair_label_tau": self.pair_labels[j],
+            }
+
+
+def make_loader(
+    dataset,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+    device_type: str,
+    drop_last: bool,
+    prefetch_factor: int = 2,
+) -> DataLoader:
     kwargs: dict[str, Any] = {}
     if device_type == "cuda":
         kwargs["pin_memory"] = True
         if int(num_workers) > 0:
             kwargs["persistent_workers"] = True
-            kwargs["prefetch_factor"] = 2
-    return DataLoader(dataset, batch_size=int(batch_size), shuffle=bool(shuffle), num_workers=int(num_workers), drop_last=bool(drop_last), **kwargs)
+            kwargs["prefetch_factor"] = int(prefetch_factor)
+    return DataLoader(
+        dataset,
+        batch_size=int(batch_size),
+        shuffle=bool(shuffle),
+        num_workers=int(num_workers),
+        drop_last=bool(drop_last),
+        **kwargs,
+    )
 
 
 def autocast_context(use_amp: bool, device: torch.device):
@@ -62,6 +129,8 @@ def make_grad_scaler(use_amp: bool, device: torch.device):
 
 
 def move_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
+    if all(value.device == device for value in batch.values()):
+        return batch
     return {key: value.to(device, non_blocking=True) for key, value in batch.items()}
 
 
@@ -81,7 +150,11 @@ def run_epoch(
     use_amp: bool,
 ) -> dict[str, float]:
     model.train(train)
-    totals = {"total_loss": 0.0, "dirichlet_loss": 0.0, "endpoint_loss": 0.0}
+    totals = {
+        "total_loss": torch.zeros((), dtype=torch.float64, device=device),
+        "dirichlet_loss": torch.zeros((), dtype=torch.float64, device=device),
+        "endpoint_loss": torch.zeros((), dtype=torch.float64, device=device),
+    }
     n_seen = 0
     iterator = tqdm(loader, desc=("train" if train else "val"), leave=False)
     for batch in iterator:
@@ -99,8 +172,9 @@ def run_epoch(
                     pair_label_tau=batch["pair_label_tau"],
                     weights=batch["weight"],
                     lambda_dirichlet=float(loss_cfg.get("lambda_dirichlet", 1.0)),
-                    lambda_endpoint=float(loss_cfg.get("lambda_endpoint", loss_cfg.get("k_scale", 100.0))),
-                    weighted_endpoint=bool(loss_cfg.get("weighted_endpoint", loss_cfg.get("weighted_restraint", False))),
+                    lambda_endpoint=float(loss_cfg.get("lambda_endpoint", 100.0)),
+                    weighted_dirichlet=bool(loss_cfg.get("weighted_dirichlet", True)),
+                    weighted_endpoint=bool(loss_cfg.get("weighted_endpoint", False)),
                 )
                 loss = losses["total_loss"]
             if train and optimizer is not None:
@@ -111,13 +185,15 @@ def run_epoch(
                 else:
                     loss.backward()
                     optimizer.step()
-        bs = int(batch["z_t"].shape[0])
-        n_seen += bs
-        for key in totals:
-            totals[key] += float(losses[key].detach().cpu().item()) * bs
-        iterator.set_postfix(loss=f"{float(loss.detach().cpu()):.3e}")
+        with torch.no_grad():
+            bs = int(batch["z_t"].shape[0])
+            n_seen += bs
+            for key in totals:
+                totals[key] += losses[key].detach().double() * bs
+            if not isinstance(loader, GpuPairwiseLaggedBatcher):
+                iterator.set_postfix(loss=f"{float(loss.detach().cpu()):.3e}")
     denom = float(max(1, n_seen))
-    return {key: value / denom for key, value in totals.items()}
+    return {key: float((value / denom).detach().cpu().item()) for key, value in totals.items()}
 
 
 def append_history(path: str, epoch: int, train_stats: dict[str, float], val_stats: dict[str, float]) -> None:
@@ -177,7 +253,9 @@ def train_pairwise_committor(config: dict[str, Any]) -> dict[str, Any]:
     pairs = unordered_pairs(n_states)
     model_features, input_meta = select_model_inputs(pack, config)
     pair_labels = pair_labels_from_state(pack.state, n_states)
-    lag = int(config.get("lag", config.get("time_shift", 1)))
+    n_frames, in_dim = model_features.shape
+
+    lag = int(config.get("lag", 1))
     ds = PairwiseLaggedDataset(
         features=model_features,
         weights=pack.weights,
@@ -188,25 +266,77 @@ def train_pairwise_committor(config: dict[str, Any]) -> dict[str, Any]:
         require_labeled=str(config.get("require_labeled", "both")),
     )
     tr_idx, va_idx = split_train_val(len(ds), float(config.get("val_ratio", 0.1)), seed=seed)
-    train_loader = make_loader(IndexSubset(ds, tr_idx), int(config.get("batch_size", 2048)), True, int(config.get("num_workers", 0)), device.type, bool(config.get("drop_last", False)))
-    val_loader = make_loader(IndexSubset(ds, va_idx), int(config.get("batch_size", 2048)), False, int(config.get("num_workers", 0)), device.type, False)
+
+    batch_size = int(config.get("batch_size", 2048))
+    drop_last = bool(config.get("drop_last", False))
+    gpu_resident_data = bool(config.get("gpu_resident_data", device.type == "cuda"))
+    if gpu_resident_data and device.type == "cuda":
+        model_features = model_features.contiguous().to(device)
+        weights_gpu = pack.weights.contiguous().to(device)
+        pair_labels_gpu = pair_labels.contiguous().to(device)
+        idx_t_gpu = ds.idx_t.contiguous().to(device)
+        idx_tau_gpu = ds.idx_tau.contiguous().to(device)
+        train_loader = GpuPairwiseLaggedBatcher(
+            model_features,
+            weights_gpu,
+            pair_labels_gpu,
+            idx_t_gpu,
+            idx_tau_gpu,
+            tr_idx,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=drop_last,
+        )
+        val_loader = GpuPairwiseLaggedBatcher(
+            model_features,
+            weights_gpu,
+            pair_labels_gpu,
+            idx_t_gpu,
+            idx_tau_gpu,
+            va_idx,
+            batch_size=batch_size,
+            shuffle=False,
+            drop_last=False,
+        )
+        data_residency = "gpu"
+    else:
+        num_workers = int(config.get("num_workers", 0))
+        train_loader = make_loader(
+            IndexSubset(ds, tr_idx),
+            batch_size,
+            True,
+            num_workers,
+            device.type,
+            drop_last,
+            prefetch_factor=int(config.get("prefetch_factor", 2)),
+        )
+        val_loader = make_loader(
+            IndexSubset(ds, va_idx),
+            batch_size,
+            False,
+            num_workers,
+            device.type,
+            False,
+            prefetch_factor=int(config.get("prefetch_factor", 2)),
+        )
+        data_residency = "cpu"
 
     model_cfg = config.get("model", {})
     if not isinstance(model_cfg, dict):
         raise ValueError("model config must be a mapping.")
     model = PairwiseCommittorNet(
-        in_dim=int(model_features.shape[1]),
+        in_dim=int(in_dim),
         n_pairs=len(pairs),
-        hidden=model_cfg.get("hidden", config.get("hidden", [256, 256, 128])),
-        activation=model_cfg.get("activation", config.get("activation", "elu")),
-        dropout=float(model_cfg.get("dropout", config.get("dropout", 0.0))),
-        batch_norm=bool(model_cfg.get("batch_norm", config.get("batch_norm", False))),
-        output_activation=model_cfg.get("output_activation", config.get("output_activation", "sigmoid")),
+        hidden=model_cfg.get("hidden", [256, 256, 128]),
+        activation=model_cfg.get("activation", "elu"),
+        dropout=float(model_cfg.get("dropout", 0.0)),
+        batch_norm=bool(model_cfg.get("batch_norm", False)),
+        output_activation=model_cfg.get("output_activation", "sigmoid"),
     ).to(device)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=float(config.get("lr", config.get("learning_rate", 1e-3))),
+        lr=float(config.get("lr", 1e-3)),
         weight_decay=float(config.get("weight_decay", 1e-6)),
     )
     scaler = make_grad_scaler(bool(config.get("use_amp", True)), device)
@@ -222,8 +352,9 @@ def train_pairwise_committor(config: dict[str, Any]) -> dict[str, Any]:
     last_ckpt_path = os.path.join(out_dir, f"{label}_last_checkpoint.pt")
 
     print(
-        f"[DATA] frames={model_features.shape[0]}, feature_dim={model_features.shape[1]}, "
-        f"model_input_space={input_meta['model_input_space']}, lag={lag}, pairs={len(ds)}, n_states={n_states}"
+        f"[DATA] frames={n_frames}, feature_dim={in_dim}, "
+        f"model_input_space={input_meta['model_input_space']}, data_residency={data_residency}, "
+        f"lag={lag}, pairs={len(ds)}, n_states={n_states}"
     )
     print(f"[MODEL] unordered pair columns={pairs}")
 
@@ -273,9 +404,12 @@ def train_pairwise_committor(config: dict[str, Any]) -> dict[str, Any]:
         "best_val": float(state.best_val),
         "n_states": int(n_states),
         "pairs": [[int(i), int(j)] for i, j in pairs],
-        "n_frames": int(model_features.shape[0]),
-        "feature_dim": int(model_features.shape[1]),
+        "n_frames": int(n_frames),
+        "feature_dim": int(in_dim),
         "model_input": input_meta,
+        "data_residency": data_residency,
+        "gpu_resident_data": bool(gpu_resident_data),
+        "lag": int(lag),
         "dataset_path": os.path.abspath(str(config["dataset_path"])),
     }
     summary_path = os.path.join(out_dir, f"{label}_summary.yaml")

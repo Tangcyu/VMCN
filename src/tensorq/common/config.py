@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
-import torch
 import yaml
 
 
@@ -36,6 +35,8 @@ def ensure_dir(path: str | os.PathLike[str]) -> str:
 
 
 def setup_device(device_str: str | None) -> torch.device:
+    import torch
+
     requested = str(device_str or "cpu")
     if requested.startswith("cuda") and torch.cuda.is_available():
         return torch.device(requested)
@@ -43,6 +44,8 @@ def setup_device(device_str: str | None) -> torch.device:
 
 
 def set_seed(seed: int) -> None:
+    import torch
+
     seed = int(seed)
     random.seed(seed)
     np.random.seed(seed)
@@ -52,6 +55,8 @@ def set_seed(seed: int) -> None:
 
 
 def torch_load(path: str | os.PathLike[str], map_location: str | torch.device = "cpu") -> Any:
+    import torch
+
     try:
         return torch.load(path, map_location=map_location, weights_only=False)
     except TypeError:

@@ -1,0 +1,73 @@
+VORONOI_MERGE:
+  # Use cluster center paths from a completed gradpath run. Every discretized
+  # image along each path becomes one initial Voronoi image.
+  images: ./gradpath_out/state_0_1/cluster_centers
+  image_kind: center
+  flatten_images: false
+
+  # Current and previous iteration samples. These can be .pt/.pth TensorQ
+  # datasets, .npz/.npy arrays, or text/csv tables.
+  samples: ./iteration_k_samples.npy
+  previous_samples: ./iteration_k_minus_1_samples.npy
+  out_dir: ./voronoi_merge_out/state_0_1_iter_k
+
+  # If samples are TensorQ datasets, use the same input convention as gradpath.
+  model_input_space: cv
+  cvs_to_use: [cv_0, cv_1]
+
+  # Periodic dimensions use Euclidean minimum-image distances.
+  # Example for two nonperiodic CVs: [null, null]
+  # Example for two angular CVs in degrees: [360.0, 360.0]
+  periods: [null, null]
+  wrap_bounds: [null, null]
+
+  # Pathway-level iterative mode keeps pathways separate, identifies shared
+  # cross-pathway dynamic segments, aligns only those segment images, then
+  # smooths/reparameterizes each pathway independently and repeats.
+  pathway_iteration:
+    enabled: true
+    max_iterations: 10
+    convergence_tol: 1.0e-4
+    lag: 1
+    terminal_image_margin: 1
+    exchange_weight_mode: count
+    min_exchange_count: 1.0
+    min_exchange_probability: 0.0
+    max_cell_distance: null
+    fixed_endpoints: true
+    cell_relaxation: 1.0
+    # Target spatial resolution: each pathway gets round(arc_length / image_spacing) images.
+    # Takes precedence over num_images when set.
+    image_spacing: null
+    # Legacy: fixed number of images per pathway (used when image_spacing is null).
+    num_images: 20
+    # After convergence, reparameterize paths with finer spacing for smooth plots.
+    # Defaults to image_spacing / 2 when image_spacing is set.
+    final_image_spacing: null
+    smooth_iterations: 2
+    smooth_window: 5
+    # Periodic geometry mode: "minimum_image" (default) or "sincos" for
+    # sin/cos-embedded geometry operations on angular coordinates.
+    periodic_geometry: minimum_image
+
+  plotting:
+    enabled: true
+    plot_axes: [0, 1]
+    plot_max_points: 100000
+    point_size: 4.0
+    point_alpha: 0.16
+    image_marker_size: 18.0
+    path_linewidth: 2.2
+    legend: true
+    # Shared-segment plot styling (shared_segments.png).
+    # shared_cmap: tab10       # colormap for distinct shared segments
+    # unique_color: gray       # colour for pathway-unique stretches
+    # unique_alpha: 0.4        # transparency of unique segments
+    # Network plot styling (pathway_network.png).
+    # edge_colormap: plasma    # colormap for exchange edges
+    # edge_max_width: 3.0      # max line width for strongest exchange edges
+    # branch_color: red        # marker colour for branch points
+
+  pseudocount: 0.0
+  eps: 1.0e-12
+  chunk_size: 65536

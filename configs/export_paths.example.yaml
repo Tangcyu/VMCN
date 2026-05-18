@@ -1,0 +1,31 @@
+EXPORT_PATHS:
+  paths_npy: ./voronoi_out/state_0_1/iteration_009/paths.npy
+  out_dir: ./exported_paths
+
+  # Reparameterization -------------------------------------------------------
+  image_spacing: 15        # target image spacing (degrees); takes precedence over num_images
+  # num_images: 20         # alternative: fixed images per path
+  smooth_iterations: 2
+  smooth_window: 5
+  periodic_geometry: sincos
+  periods: [360.0, 360.0]
+  wrap_bounds: [[-180.0, 180.0], [-180.0, 180.0]]
+
+  # Committor scoring (optional — remove or comment out to skip) -------------
+  model: ./committor_model.pt
+  dataset: ./dataset/dataset.pt
+  device: cuda:0
+  dtype: float32
+  batch_size: 65536
+  state_i: 0
+  state_j: 1
+  dataset_stride: 1
+  model_input_space: cv          # "cv" for CV-based features, "features" for raw
+  cvs_to_use: [cv_0, cv_1]      # which CV columns to use
+  periodic_cvs: [cv_0, cv_1]    # which of those are periodic (sin/cos expanded)
+  periodic_cv_units: degrees    # "degrees" or "radians"
+
+  # Plot ---------------------------------------------------------------------
+  plot: true
+  plot_axes: [0, 1]
+  path_linewidth: 2.8

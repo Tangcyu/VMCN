@@ -238,6 +238,30 @@ def validate_rate_inputs(
         raise ValueError(f"state labels must be -1 or in [0, {int(n_states) - 1}]; found {bad}.")
 
 
+def positive_weight_masks(
+    weights: np.ndarray,
+    idx0: np.ndarray,
+    idx1: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, dict[str, int]]:
+    weights = np.asarray(weights, dtype=np.float64)
+    idx0 = np.asarray(idx0, dtype=np.int64)
+    idx1 = np.asarray(idx1, dtype=np.int64)
+    frame_mask = weights > 0.0
+    if not np.any(frame_mask):
+        raise ValueError("At least one frame must have weight > 0.")
+    pair_mask = frame_mask[idx0] & frame_mask[idx1]
+    if not np.any(pair_mask):
+        raise ValueError("No lagged pairs remain after masking frames with weight == 0.")
+    stats = {
+        "n_zero_weight_frames": int(np.sum(~frame_mask)),
+        "n_positive_weight_frames": int(np.sum(frame_mask)),
+        "n_lagged_pairs_before_zero_weight_mask": int(idx0.shape[0]),
+        "n_lagged_pairs_after_zero_weight_mask": int(np.sum(pair_mask)),
+        "n_lagged_pairs_removed_by_zero_weight_mask": int(idx0.shape[0] - np.sum(pair_mask)),
+    }
+    return frame_mask, pair_mask, stats
+
+
 def estimate_flux_profiles(
     q: np.ndarray,
     weights: np.ndarray,
@@ -252,9 +276,10 @@ def estimate_flux_profiles(
     chunk_size: int,
     weighted: bool,
     return_current: bool = False,
+    return_std: bool = False,
     device: torch.device | str | None = None,
     dtype: torch.dtype = torch.float64,
-) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, ...]:
     if float(tau) <= 0 and divide_by_tau:
         raise ValueError("tau must be positive when divide_by_tau=True.")
     if float(eps) <= 0:
@@ -282,6 +307,14 @@ def estimate_flux_profiles(
     c_numer = torch.zeros(n_pairs, dtype=dtype, device=flux_device)
     c_abs_numer = torch.zeros(n_pairs, dtype=dtype, device=flux_device)
     denom = torch.zeros((), dtype=dtype, device=flux_device)
+    if return_std:
+        numer_w2 = torch.zeros_like(numer)
+        numer_x2_w2 = torch.zeros_like(numer)
+        c_numer_w2 = torch.zeros_like(c_numer)
+        c_x2_w2 = torch.zeros_like(c_numer)
+        c_abs_numer_w2 = torch.zeros_like(c_abs_numer)
+        c_abs_x2_w2 = torch.zeros_like(c_abs_numer)
+        denom_w2 = torch.zeros((), dtype=dtype, device=flux_device)
 
     for start in range(0, len(idx0), int(chunk_size)):
         end = min(len(idx0), start + int(chunk_size))
@@ -309,24 +342,73 @@ def estimate_flux_profiles(
             c_numer += torch.sum(C * w.view(-1, 1), dim=0)
             c_abs_numer += torch.sum(torch.abs(C) * w.view(-1, 1), dim=0)
             denom += torch.sum(w)
+            if return_std:
+                w2 = w * w
+                abs_C = torch.abs(C)
+                numer_w2 += torch.sum(samples * w2.view(-1, 1, 1), dim=0)
+                numer_x2_w2 += torch.sum((samples * samples) * w2.view(-1, 1, 1), dim=0)
+                c_numer_w2 += torch.sum(C * w2.view(-1, 1), dim=0)
+                c_x2_w2 += torch.sum((C * C) * w2.view(-1, 1), dim=0)
+                c_abs_numer_w2 += torch.sum(abs_C * w2.view(-1, 1), dim=0)
+                c_abs_x2_w2 += torch.sum((abs_C * abs_C) * w2.view(-1, 1), dim=0)
+                denom_w2 += torch.sum(w2)
         else:
             numer += torch.sum(samples, dim=0)
             c_numer += torch.sum(C, dim=0)
             c_abs_numer += torch.sum(torch.abs(C), dim=0)
             denom += int(end - start)
+            if return_std:
+                abs_C = torch.abs(C)
+                numer_w2 += torch.sum(samples, dim=0)
+                numer_x2_w2 += torch.sum(samples * samples, dim=0)
+                c_numer_w2 += torch.sum(C, dim=0)
+                c_x2_w2 += torch.sum(C * C, dim=0)
+                c_abs_numer_w2 += torch.sum(abs_C, dim=0)
+                c_abs_x2_w2 += torch.sum(abs_C * abs_C, dim=0)
+                denom_w2 += int(end - start)
 
     denom = torch.clamp(denom, min=torch.finfo(dtype).tiny)
-    J_t = numer / denom
+    J_raw_t = numer / denom
+    J_t = J_raw_t
     if divide_by_tau:
         J_t = J_t / float(tau)
     variance_t = torch.mean((J_t - J_t.mean(dim=1, keepdim=True)) ** 2, dim=1)
     J = J_t.detach().cpu().numpy().astype(np.float64)
     variance = variance_t.detach().cpu().numpy().astype(np.float64)
+    outputs: list[np.ndarray] = [J, variance]
+    C_mean_t = c_numer / denom
+    C_abs_mean_t = c_abs_numer / denom
     if return_current:
-        C_mean = (c_numer / denom).detach().cpu().numpy().astype(np.float64)
-        C_abs_mean = (c_abs_numer / denom).detach().cpu().numpy().astype(np.float64)
-        return J, variance, C_mean, C_abs_mean
-    return J, variance
+        outputs.extend(
+            [
+                C_mean_t.detach().cpu().numpy().astype(np.float64),
+                C_abs_mean_t.detach().cpu().numpy().astype(np.float64),
+            ]
+        )
+    if return_std:
+        denom_sq = torch.clamp(denom * denom, min=torch.finfo(dtype).tiny)
+        J_var_t = torch.clamp(
+            numer_x2_w2 - 2.0 * J_raw_t * numer_w2 + (J_raw_t * J_raw_t) * denom_w2,
+            min=0.0,
+        ) / denom_sq
+        if divide_by_tau:
+            J_var_t = J_var_t / (float(tau) * float(tau))
+        C_var_t = torch.clamp(
+            c_x2_w2 - 2.0 * C_mean_t * c_numer_w2 + (C_mean_t * C_mean_t) * denom_w2,
+            min=0.0,
+        ) / denom_sq
+        C_abs_var_t = torch.clamp(
+            c_abs_x2_w2 - 2.0 * C_abs_mean_t * c_abs_numer_w2 + (C_abs_mean_t * C_abs_mean_t) * denom_w2,
+            min=0.0,
+        ) / denom_sq
+        outputs.extend(
+            [
+                torch.sqrt(J_var_t).detach().cpu().numpy().astype(np.float64),
+                torch.sqrt(C_var_t).detach().cpu().numpy().astype(np.float64),
+                torch.sqrt(C_abs_var_t).detach().cpu().numpy().astype(np.float64),
+            ]
+        )
+    return tuple(outputs)
 
 
 def estimate_pi(
@@ -407,12 +489,72 @@ def matrix_from_pair_values(
     return mat
 
 
-def assemble_generator(k_direct: np.ndarray) -> np.ndarray:
-    k_direct = np.asarray(k_direct, dtype=np.float64)
-    if k_direct.ndim != 2 or k_direct.shape[0] != k_direct.shape[1]:
-        raise ValueError(f"k_direct must be a square matrix; got {k_direct.shape}.")
-    K = k_direct.copy()
+def sanitize_rate_matrix(
+    k_direct: np.ndarray,
+    *,
+    negative_policy: str = "clip",
+    negative_tol: float = 0.0,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """
+    Enforce generator-compatible off-diagonal rates.
+
+    Flux estimates can have tiny negative values from finite sampling or
+    threshold averaging. A continuous-time generator cannot use negative
+    off-diagonal rates, so the default is to clip them before MFPT/P_jump
+    calculations and before writing k_direct.
+    """
+    K = np.asarray(k_direct, dtype=np.float64).copy()
+    if K.ndim != 2 or K.shape[0] != K.shape[1]:
+        raise ValueError(f"k_direct must be a square matrix; got {K.shape}.")
+    if not np.all(np.isfinite(K)):
+        raise ValueError("k_direct contains non-finite values.")
+    negative_tol = float(negative_tol)
+    if negative_tol < 0:
+        raise ValueError("negative_rate_tolerance must be >= 0.")
+
     np.fill_diagonal(K, 0.0)
+    offdiag = ~np.eye(K.shape[0], dtype=bool)
+    negative = (K < 0.0) & offdiag
+    significant = (K < -negative_tol) & offdiag
+    policy = str(negative_policy).lower()
+    if policy not in {"clip", "raise", "allow"}:
+        raise ValueError("negative_rate_policy must be 'clip', 'raise', or 'allow'.")
+    if policy == "raise" and np.any(significant):
+        i, j = np.argwhere(significant)[0]
+        raise ValueError(
+            "k_direct contains negative off-diagonal rates; "
+            f"first significant entry k[{int(i)},{int(j)}]={K[i, j]:.6g}. "
+            "Set negative_rate_policy: 'clip' to truncate them to zero."
+        )
+    if policy == "clip":
+        K[negative] = 0.0
+    elif policy == "raise" and np.any(negative):
+        K[negative] = 0.0
+
+    stats = {
+        "negative_rate_policy": policy,
+        "negative_rate_tolerance": negative_tol,
+        "n_negative_offdiag_rates": int(np.sum(negative)),
+        "n_significant_negative_offdiag_rates": int(np.sum(significant)),
+        "min_offdiag_rate_before_sanitize": float(np.min(np.asarray(k_direct, dtype=np.float64)[offdiag])),
+        "total_negative_offdiag_rate_before_sanitize": (
+            float(np.sum(np.asarray(k_direct, dtype=np.float64)[negative])) if np.any(negative) else 0.0
+        ),
+    }
+    return K, stats
+
+
+def assemble_generator(
+    k_direct: np.ndarray,
+    *,
+    negative_policy: str = "clip",
+    negative_tol: float = 0.0,
+) -> np.ndarray:
+    K, _stats = sanitize_rate_matrix(
+        k_direct,
+        negative_policy=negative_policy,
+        negative_tol=negative_tol,
+    )
     for i in range(K.shape[0]):
         K[i, i] = -float(np.sum(K[i]))
     return K
@@ -475,6 +617,329 @@ def compute_mfpt_rate_matrix(mfpt: np.ndarray) -> np.ndarray:
     return rate
 
 
+def _nanstd(values: list[np.ndarray]) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.shape[0] < 2:
+        return np.full(arr.shape[1:], np.nan, dtype=np.float64)
+    finite = np.isfinite(arr)
+    count = np.sum(finite, axis=0)
+    value_scale = np.max(np.where(finite, np.abs(arr), 0.0), axis=0)
+    nonzero = (count > 0) & np.isfinite(value_scale) & (value_scale > 0)
+    scaled_arr = np.divide(arr, value_scale, out=np.zeros_like(arr), where=finite & nonzero[None, ...])
+    scaled_mean = np.divide(
+        np.sum(scaled_arr, axis=0),
+        count,
+        out=np.full(arr.shape[1:], np.nan),
+        where=nonzero,
+    )
+    mean = value_scale * scaled_mean
+    mean[(count > 0) & np.isfinite(value_scale) & (value_scale == 0)] = 0.0
+    centered = np.where(finite, arr - mean, 0.0)
+    scale = np.max(np.where(finite, np.abs(centered), 0.0), axis=0)
+    valid = (count > 1) & np.isfinite(scale) & (scale > 0)
+    scaled = np.divide(centered, scale, out=np.zeros_like(centered), where=valid[None, ...])
+    scaled_var = np.divide(
+        np.sum(scaled * scaled, axis=0),
+        count - 1,
+        out=np.full(arr.shape[1:], np.nan),
+        where=valid,
+    )
+    out = scale * np.sqrt(np.maximum(scaled_var, 0.0))
+    out[(count > 1) & np.isfinite(scale) & (scale == 0)] = 0.0
+    out[count <= 1] = np.nan
+    return out
+
+
+def _combine_std(*parts: np.ndarray | None) -> np.ndarray | None:
+    arrays = [np.asarray(part, dtype=np.float64) for part in parts if part is not None]
+    if not arrays:
+        return None
+    total = np.zeros_like(arrays[0], dtype=np.float64)
+    any_finite = np.zeros_like(arrays[0], dtype=bool)
+    for arr in arrays:
+        finite = np.isfinite(arr)
+        total += np.where(finite, arr * arr, 0.0)
+        any_finite |= finite
+    out = np.sqrt(total)
+    out[~any_finite] = np.nan
+    return out
+
+
+def _weighted_mean_std(values: np.ndarray, weights: np.ndarray, mean: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    mean = np.asarray(mean, dtype=np.float64)
+    denom = float(np.sum(weights))
+    if denom <= 0 or values.shape[0] == 0:
+        return np.full(mean.shape, np.nan, dtype=np.float64)
+    centered = values - mean
+    var = np.sum((weights[:, None] * centered) ** 2, axis=0) / max(denom * denom, 1e-300)
+    return np.sqrt(np.maximum(var, 0.0))
+
+
+def estimate_pi_std(
+    q: np.ndarray,
+    weights: np.ndarray,
+    state: np.ndarray,
+    pi: np.ndarray,
+    n_states: int,
+    mode: str = "labels",
+) -> np.ndarray:
+    w = np.asarray(weights, dtype=np.float64)
+    denom = float(np.sum(w))
+    if denom <= 0:
+        return np.full(int(n_states), np.nan, dtype=np.float64)
+    mode = str(mode).lower()
+    if mode == "soft" or (mode == "labels" and not np.any(np.asarray(state) >= 0)):
+        values = np.asarray(q, dtype=np.float64)
+    elif mode == "labels":
+        labels = np.asarray(state, dtype=np.int64)
+        values = np.column_stack([(labels == k).astype(np.float64) for k in range(int(n_states))])
+    else:
+        raise ValueError("pi_mode must be either 'labels' or 'soft'.")
+    return _weighted_mean_std(values, w, np.asarray(pi, dtype=np.float64))
+
+
+def estimate_transition_hit_matrix_std(
+    q: np.ndarray,
+    weights: np.ndarray,
+    state: np.ndarray,
+    idx0: np.ndarray,
+    idx1: np.ndarray,
+    T_hit: np.ndarray,
+    n_states: int,
+    *,
+    weighted: bool = True,
+    labeled_exits_only: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    q = np.asarray(q, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    state = np.asarray(state, dtype=np.int64)
+    T_hit = np.asarray(T_hit, dtype=np.float64)
+    T_std = np.full_like(T_hit, np.nan, dtype=np.float64)
+    count_std = np.zeros(int(n_states), dtype=np.float64)
+    weight_std = np.zeros(int(n_states), dtype=np.float64)
+    for i in range(int(n_states)):
+        mask = (state[idx0] == i) & (state[idx1] != i)
+        if labeled_exits_only:
+            mask &= state[idx1] >= 0
+        ids0 = idx0[mask]
+        ids1 = idx1[mask]
+        count_std[i] = np.sqrt(float(ids1.size))
+        if ids1.size == 0:
+            continue
+        w = weights[ids0] if weighted else np.ones(ids1.size, dtype=np.float64)
+        weight_std[i] = float(np.sqrt(np.sum(w * w)))
+        if np.sum(w) > 0:
+            T_std[i] = _weighted_mean_std(q[ids1], w, T_hit[i])
+    return T_std, count_std, weight_std
+
+
+def _slice_lagged_pairs(idx0: np.ndarray, n_slices: int, min_pairs: int) -> list[np.ndarray]:
+    n_pairs = int(idx0.shape[0])
+    if n_pairs <= 0:
+        return []
+    n_slices = max(1, min(int(n_slices), n_pairs))
+    slices = [part.astype(np.int64) for part in np.array_split(np.arange(n_pairs, dtype=np.int64), n_slices)]
+    return [part for part in slices if part.size >= int(min_pairs)]
+
+
+def _rate_matrices_from_estimates(
+    n_states: int,
+    pairs: list[tuple[int, int]],
+    J: np.ndarray,
+    C_mean: np.ndarray,
+    C_abs_mean: np.ndarray,
+    pi: np.ndarray,
+    time_unit: str,
+) -> dict[str, np.ndarray]:
+    _, J_matrix, k_direct = build_rate_table(pairs, J, np.zeros(len(pairs), dtype=np.float64), pi, time_unit)
+    k_direct, _rate_sanitize = sanitize_rate_matrix(k_direct)
+    C_matrix = matrix_from_pair_values(n_states, pairs, C_mean, fill=0.0)
+    C_abs_matrix = matrix_from_pair_values(n_states, pairs, C_abs_mean, fill=0.0)
+    K = assemble_generator(k_direct)
+    P_jump = compute_jump_probabilities(K)
+    mfpt = compute_mfpt_matrix(K)
+    k_mfpt = compute_mfpt_rate_matrix(mfpt)
+    return {
+        "J_thresholds": np.asarray(J, dtype=np.float64),
+        "J_matrix": J_matrix,
+        "C_matrix": C_matrix,
+        "C_abs_matrix": C_abs_matrix,
+        "k_direct": k_direct,
+        "k_matrix": k_direct,
+        "K": K,
+        "P_jump": P_jump,
+        "MFPT": mfpt,
+        "k_mfpt": k_mfpt,
+    }
+
+
+def propagate_generator_std(K: np.ndarray, K_offdiag_std: np.ndarray) -> dict[str, np.ndarray]:
+    K = np.asarray(K, dtype=np.float64)
+    K_offdiag_std = np.asarray(K_offdiag_std, dtype=np.float64)
+    if K.ndim != 2 or K.shape[0] != K.shape[1]:
+        raise ValueError(f"K must be a square matrix; got {K.shape}.")
+    if K_offdiag_std.shape != K.shape:
+        raise ValueError(f"K_offdiag_std shape {K_offdiag_std.shape} does not match K shape {K.shape}.")
+    n_states = K.shape[0]
+    K_std = np.where(np.isfinite(K_offdiag_std), K_offdiag_std, np.nan)
+    np.fill_diagonal(K_std, 0.0)
+    for i in range(n_states):
+        row = np.delete(K_std[i], i)
+        K_std[i, i] = float(np.sqrt(np.nansum(row * row)))
+
+    p_var = np.zeros_like(K, dtype=np.float64)
+    mfpt_var = np.zeros_like(K, dtype=np.float64)
+    k_mfpt_var = np.zeros_like(K, dtype=np.float64)
+    for i in range(n_states):
+        for j in range(n_states):
+            step = float(K_offdiag_std[i, j])
+            if i == j or not np.isfinite(step) or step <= 0:
+                continue
+            plus = K.copy()
+            minus = K.copy()
+            plus[i, j] = max(0.0, plus[i, j] + step)
+            minus[i, j] = max(0.0, minus[i, j] - step)
+            plus[i, i] = -float(np.sum(np.delete(plus[i], i)))
+            minus[i, i] = -float(np.sum(np.delete(minus[i], i)))
+            p_plus = compute_jump_probabilities(plus)
+            p_minus = compute_jump_probabilities(minus)
+            mfpt_plus = compute_mfpt_matrix(plus)
+            mfpt_minus = compute_mfpt_matrix(minus)
+            k_mfpt_plus = compute_mfpt_rate_matrix(mfpt_plus)
+            k_mfpt_minus = compute_mfpt_rate_matrix(mfpt_minus)
+            p_var += np.nan_to_num(0.5 * (p_plus - p_minus), nan=0.0) ** 2
+            mfpt_var += np.nan_to_num(0.5 * (mfpt_plus - mfpt_minus), nan=0.0) ** 2
+            k_mfpt_var += np.nan_to_num(0.5 * (k_mfpt_plus - k_mfpt_minus), nan=0.0) ** 2
+    return {
+        "K": K_std,
+        "P_jump": np.sqrt(p_var),
+        "MFPT": np.sqrt(mfpt_var),
+        "k_mfpt": np.sqrt(k_mfpt_var),
+    }
+
+
+def propagate_rate_matrix_std(k_direct: np.ndarray, k_direct_std: np.ndarray) -> dict[str, np.ndarray]:
+    return propagate_generator_std(assemble_generator(k_direct), k_direct_std)
+
+
+def estimate_slice_rate_std(
+    q: np.ndarray,
+    weights: np.ndarray,
+    state: np.ndarray,
+    idx0: np.ndarray,
+    idx1: np.ndarray,
+    n_states: int,
+    pairs: list[tuple[int, int]],
+    thresholds: np.ndarray,
+    *,
+    tau: float,
+    divide_by_tau: bool,
+    eps: float,
+    surface: str,
+    chunk_size: int,
+    weighted_flux: bool,
+    weighted_hits: bool,
+    labeled_exits_only: bool,
+    pi_mode: str,
+    time_unit: str,
+    n_slices: int,
+    min_pairs: int,
+    device: torch.device | str | None,
+    dtype: torch.dtype,
+) -> tuple[dict[str, np.ndarray], int]:
+    collected: dict[str, list[np.ndarray]] = {
+        "pi": [],
+        "T_hit": [],
+        "exit_counts": [],
+        "exit_weight": [],
+        "J_thresholds": [],
+        "J_matrix": [],
+        "C_matrix": [],
+        "C_abs_matrix": [],
+        "k_direct": [],
+        "k_matrix": [],
+        "K": [],
+        "P_jump": [],
+        "MFPT": [],
+        "k_mfpt": [],
+    }
+    for pair_slice in _slice_lagged_pairs(idx0, n_slices, min_pairs):
+        s_idx0 = idx0[pair_slice]
+        s_idx1 = idx1[pair_slice]
+        frame_ids = np.unique(s_idx0)
+        if frame_ids.size == 0:
+            continue
+        s_pi = estimate_pi(q[frame_ids], weights[frame_ids], state[frame_ids], n_states, mode=pi_mode)
+        s_flux = estimate_flux_profiles(
+            q=q,
+            weights=weights,
+            idx0=s_idx0,
+            idx1=s_idx1,
+            pairs=pairs,
+            thresholds=thresholds,
+            eps=eps,
+            tau=tau,
+            divide_by_tau=divide_by_tau,
+            surface=surface,
+            chunk_size=chunk_size,
+            weighted=weighted_flux,
+            return_current=True,
+            device=device,
+            dtype=dtype,
+        )
+        s_J, _s_variance, s_C_mean, s_C_abs_mean = s_flux
+        s_T_hit, s_exit_counts, s_exit_weight = estimate_transition_hit_matrix(
+            q=q,
+            weights=weights,
+            state=state,
+            idx0=s_idx0,
+            idx1=s_idx1,
+            n_states=n_states,
+            weighted=weighted_hits,
+            labeled_exits_only=labeled_exits_only,
+        )
+        collected["pi"].append(s_pi)
+        collected["T_hit"].append(s_T_hit)
+        collected["exit_counts"].append(s_exit_counts.astype(np.float64))
+        collected["exit_weight"].append(s_exit_weight)
+        for name, value in _rate_matrices_from_estimates(
+            n_states, pairs, s_J, s_C_mean, s_C_abs_mean, s_pi, time_unit
+        ).items():
+            collected[name].append(value)
+    used = len(collected["pi"])
+    if used < 2:
+        return {}, used
+    return {name: _nanstd(values) for name, values in collected.items()}, used
+
+
+def build_rate_std_table(
+    pairs: list[tuple[int, int]],
+    pi_std: np.ndarray,
+    J_matrix_std: np.ndarray,
+    k_direct_std: np.ndarray,
+    time_unit: str,
+    k_mfpt_std: np.ndarray | None = None,
+) -> pd.DataFrame:
+    rows = []
+    k_rate_std = k_direct_std if k_mfpt_std is None else k_mfpt_std
+    for i, j in pairs:
+        row = {
+            "state_i": int(i),
+            "state_j": int(j),
+            "pi_i_std": float(pi_std[i]) if np.isfinite(pi_std[i]) else np.nan,
+            "J_ij_std": float(J_matrix_std[i, j]) if np.isfinite(J_matrix_std[i, j]) else np.nan,
+            "k_direct_ij_std": float(k_direct_std[i, j]) if np.isfinite(k_direct_std[i, j]) else np.nan,
+        }
+        if k_mfpt_std is not None:
+            row["k_mfpt_ij_std"] = float(k_mfpt_std[i, j]) if np.isfinite(k_mfpt_std[i, j]) else np.nan
+        row["k_ij_std"] = float(k_rate_std[i, j]) if np.isfinite(k_rate_std[i, j]) else np.nan
+        row["k_unit"] = f"1/{time_unit}"
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def write_flux_profiles_csv(
     path: str,
     pairs: list[tuple[int, int]],
@@ -497,12 +962,40 @@ def write_flux_profiles_csv(
     pd.DataFrame(rows).to_csv(path, index=False)
 
 
+def write_flux_profiles_std_csv(
+    path: str,
+    pairs: list[tuple[int, int]],
+    thresholds: np.ndarray,
+    J_std: np.ndarray,
+) -> None:
+    rows = []
+    for p_idx, (i, j) in enumerate(pairs):
+        for t_idx, c in enumerate(thresholds):
+            rows.append(
+                {
+                    "state_i": i,
+                    "state_j": j,
+                    "threshold": float(c),
+                    "J_ij_std": float(J_std[p_idx, t_idx]) if np.isfinite(J_std[p_idx, t_idx]) else np.nan,
+                }
+            )
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
 def write_matrix_csv(path: str, matrix: np.ndarray, *, index_name: str = "state_i") -> None:
     pd.DataFrame(np.asarray(matrix, dtype=np.float64)).to_csv(path, index_label=index_name)
 
 
 def write_population_csv(path: str, pi: np.ndarray) -> None:
     rows = [{"state": int(i), "pi": float(pi_i)} for i, pi_i in enumerate(np.asarray(pi, dtype=np.float64))]
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def write_population_std_csv(path: str, pi_std: np.ndarray) -> None:
+    rows = [
+        {"state": int(i), "pi_std": float(std_i) if np.isfinite(std_i) else np.nan}
+        for i, std_i in enumerate(np.asarray(pi_std, dtype=np.float64))
+    ]
     pd.DataFrame(rows).to_csv(path, index=False)
 
 
@@ -522,6 +1015,27 @@ def write_transition_hit_csv(
                     "T_hit_ij": float(T_hit[i, j]) if np.isfinite(T_hit[i, j]) else np.nan,
                     "exit_count_i": int(exit_counts[i]),
                     "exit_weight_i": float(exit_weight[i]),
+                }
+            )
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def write_transition_hit_std_csv(
+    path: str,
+    T_hit_std: np.ndarray,
+    exit_counts_std: np.ndarray,
+    exit_weight_std: np.ndarray,
+) -> None:
+    rows = []
+    for i in range(T_hit_std.shape[0]):
+        for j in range(T_hit_std.shape[1]):
+            rows.append(
+                {
+                    "state_i": int(i),
+                    "state_j": int(j),
+                    "T_hit_ij_std": float(T_hit_std[i, j]) if np.isfinite(T_hit_std[i, j]) else np.nan,
+                    "exit_count_i_std": float(exit_counts_std[i]) if np.isfinite(exit_counts_std[i]) else np.nan,
+                    "exit_weight_i_std": float(exit_weight_std[i]) if np.isfinite(exit_weight_std[i]) else np.nan,
                 }
             )
     pd.DataFrame(rows).to_csv(path, index=False)
@@ -659,6 +1173,29 @@ def build_rate_table(
     return pd.DataFrame(rows), J_matrix, k_direct
 
 
+def add_mfpt_rates_to_table(
+    table: pd.DataFrame,
+    pairs: list[tuple[int, int]],
+    k_mfpt: np.ndarray,
+) -> pd.DataFrame:
+    table = table.copy()
+    k_mfpt_ij = [float(k_mfpt[i, j]) if np.isfinite(k_mfpt[i, j]) else np.nan for i, j in pairs]
+    table["k_mfpt_ij"] = k_mfpt_ij
+    table["k_ij"] = k_mfpt_ij
+    columns = [
+        "state_i",
+        "state_j",
+        "pi_i",
+        "J_ij",
+        "J_threshold_variance",
+        "k_direct_ij",
+        "k_mfpt_ij",
+        "k_ij",
+        "k_unit",
+    ]
+    return table[[col for col in columns if col in table.columns]]
+
+
 def run(config: dict[str, Any]) -> dict[str, Any]:
     config, model_input_summary = apply_checkpoint_model_input_config(config)
     out_dir = ensure_dir(config.get("out_dir", "./next_hit_rate"))
@@ -711,7 +1248,13 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
     weights = pack.weights.numpy().astype(np.float64)
     state = pack.state.numpy().astype(np.int64)
     validate_rate_inputs(q, weights, state, idx0, idx1, n_states)
-    J, variance, C_mean, C_abs_mean = estimate_flux_profiles(
+    positive_frame_mask, positive_pair_mask, zero_weight_mask_stats = positive_weight_masks(weights, idx0, idx1)
+    idx0 = idx0[positive_pair_mask]
+    idx1 = idx1[positive_pair_mask]
+    q_weighted = q[positive_frame_mask]
+    weights_weighted = weights[positive_frame_mask]
+    state_weighted = state[positive_frame_mask]
+    J, variance, C_mean, C_abs_mean, J_thresholds_direct_std, C_direct_std, C_abs_direct_std = estimate_flux_profiles(
         q=q,
         weights=weights,
         idx0=idx0,
@@ -725,13 +1268,14 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
         chunk_size=int(config.get("chunk_size", 20000)),
         weighted=bool(config.get("weighted_flux", True)),
         return_current=True,
+        return_std=True,
         device=flux_device,
         dtype=flux_dtype,
     )
     pi = estimate_pi(
-        q=q,
-        weights=weights,
-        state=state,
+        q=q_weighted,
+        weights=weights_weighted,
+        state=state_weighted,
         n_states=n_states,
         mode=str(config.get("pi_mode", "labels")),
     )
@@ -746,12 +1290,119 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
         labeled_exits_only=bool(config.get("labeled_exits_only", False)),
     )
     table, J_matrix, k_direct = build_rate_table(pairs, J, variance, pi, time_unit)
+    k_direct_raw = k_direct.copy()
+    k_direct, rate_sanitize = sanitize_rate_matrix(
+        k_direct,
+        negative_policy=str(config.get("negative_rate_policy", "clip")),
+        negative_tol=float(config.get("negative_rate_tolerance", 0.0)),
+    )
+    if rate_sanitize["n_negative_offdiag_rates"] > 0 and rate_sanitize["negative_rate_policy"] == "clip":
+        print(
+            "[RATE] Clipped "
+            f"{rate_sanitize['n_negative_offdiag_rates']} negative off-diagonal k_direct entries "
+            "to zero before generator/MFPT calculations."
+        )
+    for row_idx, (i, j) in enumerate(pairs):
+        table.loc[row_idx, "k_direct_ij"] = float(k_direct[i, j])
+        table.loc[row_idx, "k_ij"] = float(k_direct[i, j])
     C_matrix = matrix_from_pair_values(n_states, pairs, C_mean, fill=0.0)
     C_abs_matrix = matrix_from_pair_values(n_states, pairs, C_abs_mean, fill=0.0)
-    K = assemble_generator(k_direct)
+    K = assemble_generator(
+        k_direct,
+        negative_policy=str(config.get("negative_rate_policy", "clip")),
+        negative_tol=float(config.get("negative_rate_tolerance", 0.0)),
+    )
     P_jump = compute_jump_probabilities(K)
     mfpt = compute_mfpt_matrix(K)
     k_mfpt = compute_mfpt_rate_matrix(mfpt)
+    table = add_mfpt_rates_to_table(table, pairs, k_mfpt)
+
+    pi_direct_std = estimate_pi_std(
+        q_weighted, weights_weighted, state_weighted, pi, n_states, mode=str(config.get("pi_mode", "labels"))
+    )
+    T_hit_direct_std, exit_counts_direct_std, exit_weight_direct_std = estimate_transition_hit_matrix_std(
+        q=q,
+        weights=weights,
+        state=state,
+        idx0=idx0,
+        idx1=idx1,
+        T_hit=T_hit,
+        n_states=n_states,
+        weighted=bool(config.get("weighted_hits", config.get("weighted_flux", True))),
+        labeled_exits_only=bool(config.get("labeled_exits_only", False)),
+    )
+    Jbar_direct_std = np.sqrt(np.nanmean(J_thresholds_direct_std * J_thresholds_direct_std, axis=1))
+    Jbar_direct_std = np.sqrt(Jbar_direct_std * Jbar_direct_std + np.maximum(variance, 0.0))
+    J_matrix_direct_std = matrix_from_pair_values(n_states, pairs, Jbar_direct_std, fill=np.nan)
+    C_matrix_direct_std = matrix_from_pair_values(n_states, pairs, C_direct_std, fill=np.nan)
+    C_abs_matrix_direct_std = matrix_from_pair_values(n_states, pairs, C_abs_direct_std, fill=np.nan)
+    k_direct_direct_std = np.zeros((n_states, n_states), dtype=np.float64)
+    k_direct_direct_std[:] = np.nan
+    for p_idx, (i, j) in enumerate(pairs):
+        denom = max(float(pi[i]), 1e-300)
+        kij = float(k_direct[i, j])
+        k_direct_direct_std[i, j] = np.sqrt(
+            (float(Jbar_direct_std[p_idx]) / denom) ** 2 + ((kij * float(pi_direct_std[i])) / denom) ** 2
+        )
+
+    error_enabled = bool(config.get("error_analysis", True))
+    error_n_slices = int(config.get("error_n_slices", config.get("n_error_slices", 10)))
+    error_min_pairs = int(config.get("error_min_pairs_per_slice", 1))
+    slice_std: dict[str, np.ndarray] = {}
+    n_error_slices_used = 0
+    if error_enabled and error_n_slices >= 2 and len(idx0) >= 2:
+        slice_std, n_error_slices_used = estimate_slice_rate_std(
+            q=q,
+            weights=weights,
+            state=state,
+            idx0=idx0,
+            idx1=idx1,
+            n_states=n_states,
+            pairs=pairs,
+            thresholds=thresholds,
+            tau=tau,
+            divide_by_tau=bool(config.get("divide_by_tau", True)),
+            eps=float(config.get("flux_eps", 0.02)),
+            surface=str(config.get("flux_surface", "qi_decrease")),
+            chunk_size=int(config.get("chunk_size", 20000)),
+            weighted_flux=bool(config.get("weighted_flux", True)),
+            weighted_hits=bool(config.get("weighted_hits", config.get("weighted_flux", True))),
+            labeled_exits_only=bool(config.get("labeled_exits_only", False)),
+            pi_mode=str(config.get("pi_mode", "labels")),
+            time_unit=time_unit,
+            n_slices=error_n_slices,
+            min_pairs=error_min_pairs,
+            device=flux_device,
+            dtype=flux_dtype,
+        )
+
+    pi_std = _combine_std(pi_direct_std, slice_std.get("pi"))
+    T_hit_std = _combine_std(T_hit_direct_std, slice_std.get("T_hit"))
+    exit_counts_std = _combine_std(exit_counts_direct_std, slice_std.get("exit_counts"))
+    exit_weight_std = _combine_std(exit_weight_direct_std, slice_std.get("exit_weight"))
+    J_thresholds_std = _combine_std(J_thresholds_direct_std, slice_std.get("J_thresholds"))
+    J_matrix_std = _combine_std(J_matrix_direct_std, slice_std.get("J_matrix"))
+    C_matrix_std = _combine_std(C_matrix_direct_std, slice_std.get("C_matrix"))
+    C_abs_matrix_std = _combine_std(C_abs_matrix_direct_std, slice_std.get("C_abs_matrix"))
+    k_direct_std = _combine_std(k_direct_direct_std, slice_std.get("k_direct"))
+    assert pi_std is not None
+    assert T_hit_std is not None
+    assert exit_counts_std is not None
+    assert exit_weight_std is not None
+    assert J_thresholds_std is not None
+    assert J_matrix_std is not None
+    assert C_matrix_std is not None
+    assert C_abs_matrix_std is not None
+    assert k_direct_std is not None
+    propagated_std = propagate_rate_matrix_std(k_direct, k_direct_std)
+    K_std = _combine_std(propagated_std["K"], slice_std.get("K"))
+    P_jump_std = _combine_std(propagated_std["P_jump"], slice_std.get("P_jump"))
+    MFPT_std = _combine_std(propagated_std["MFPT"], slice_std.get("MFPT"))
+    k_mfpt_std = _combine_std(propagated_std["k_mfpt"], slice_std.get("k_mfpt"))
+    assert K_std is not None
+    assert P_jump_std is not None
+    assert MFPT_std is not None
+    assert k_mfpt_std is not None
 
     np.save(os.path.join(out_dir, "Q.npy"), q.astype(np.float32))
     np.save(os.path.join(out_dir, "pi.npy"), pi)
@@ -760,25 +1411,58 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
     np.save(os.path.join(out_dir, "J_matrix.npy"), J_matrix)
     np.save(os.path.join(out_dir, "C_matrix.npy"), C_matrix)
     np.save(os.path.join(out_dir, "C_abs_matrix.npy"), C_abs_matrix)
+    np.save(os.path.join(out_dir, "k_direct_raw.npy"), k_direct_raw)
     np.save(os.path.join(out_dir, "k_direct.npy"), k_direct)
     np.save(os.path.join(out_dir, "k_matrix.npy"), k_direct)
     np.save(os.path.join(out_dir, "K.npy"), K)
     np.save(os.path.join(out_dir, "P_jump.npy"), P_jump)
     np.save(os.path.join(out_dir, "MFPT.npy"), mfpt)
     np.save(os.path.join(out_dir, "k_mfpt.npy"), k_mfpt)
+    np.save(os.path.join(out_dir, "pi_std.npy"), pi_std)
+    np.save(os.path.join(out_dir, "T_hit_std.npy"), T_hit_std)
+    np.save(os.path.join(out_dir, "J_thresholds_std.npy"), J_thresholds_std)
+    np.save(os.path.join(out_dir, "J_matrix_std.npy"), J_matrix_std)
+    np.save(os.path.join(out_dir, "C_matrix_std.npy"), C_matrix_std)
+    np.save(os.path.join(out_dir, "C_abs_matrix_std.npy"), C_abs_matrix_std)
+    np.save(os.path.join(out_dir, "k_direct_std.npy"), k_direct_std)
+    np.save(os.path.join(out_dir, "k_matrix_std.npy"), k_direct_std)
+    np.save(os.path.join(out_dir, "K_std.npy"), K_std)
+    np.save(os.path.join(out_dir, "P_jump_std.npy"), P_jump_std)
+    np.save(os.path.join(out_dir, "MFPT_std.npy"), MFPT_std)
+    np.save(os.path.join(out_dir, "k_mfpt_std.npy"), k_mfpt_std)
     write_flux_profiles_csv(os.path.join(out_dir, "flux_profiles.csv"), pairs, thresholds, J, variance)
+    write_flux_profiles_std_csv(os.path.join(out_dir, "flux_profiles_std.csv"), pairs, thresholds, J_thresholds_std)
     write_population_csv(os.path.join(out_dir, "populations.csv"), pi)
+    write_population_std_csv(os.path.join(out_dir, "populations_std.csv"), pi_std)
+    write_population_std_csv(os.path.join(out_dir, "pi_std.csv"), pi_std)
     write_transition_hit_csv(os.path.join(out_dir, "transition_hit_matrix.csv"), T_hit, exit_counts, exit_weight)
+    write_transition_hit_std_csv(
+        os.path.join(out_dir, "transition_hit_matrix_std.csv"), T_hit_std, exit_counts_std, exit_weight_std
+    )
+    write_matrix_csv(os.path.join(out_dir, "T_hit_std.csv"), T_hit_std)
     table.to_csv(os.path.join(out_dir, "rate_constants.csv"), index=False)
+    build_rate_std_table(pairs, pi_std, J_matrix_std, k_direct_std, time_unit, k_mfpt_std=k_mfpt_std).to_csv(
+        os.path.join(out_dir, "rate_constants_std.csv"), index=False
+    )
     write_matrix_csv(os.path.join(out_dir, "J_matrix.csv"), J_matrix)
+    write_matrix_csv(os.path.join(out_dir, "J_matrix_std.csv"), J_matrix_std)
     write_matrix_csv(os.path.join(out_dir, "C_matrix.csv"), C_matrix)
+    write_matrix_csv(os.path.join(out_dir, "C_matrix_std.csv"), C_matrix_std)
     write_matrix_csv(os.path.join(out_dir, "C_abs_matrix.csv"), C_abs_matrix)
+    write_matrix_csv(os.path.join(out_dir, "C_abs_matrix_std.csv"), C_abs_matrix_std)
+    write_matrix_csv(os.path.join(out_dir, "k_direct_raw.csv"), k_direct_raw)
     write_matrix_csv(os.path.join(out_dir, "k_direct.csv"), k_direct)
+    write_matrix_csv(os.path.join(out_dir, "k_direct_std.csv"), k_direct_std)
     write_matrix_csv(os.path.join(out_dir, "k_matrix.csv"), k_direct)
+    write_matrix_csv(os.path.join(out_dir, "k_matrix_std.csv"), k_direct_std)
     write_matrix_csv(os.path.join(out_dir, "K.csv"), K)
+    write_matrix_csv(os.path.join(out_dir, "K_std.csv"), K_std)
     write_matrix_csv(os.path.join(out_dir, "P_jump.csv"), P_jump)
+    write_matrix_csv(os.path.join(out_dir, "P_jump_std.csv"), P_jump_std)
     write_matrix_csv(os.path.join(out_dir, "MFPT.csv"), mfpt)
+    write_matrix_csv(os.path.join(out_dir, "MFPT_std.csv"), MFPT_std)
     write_matrix_csv(os.path.join(out_dir, "k_mfpt.csv"), k_mfpt)
+    write_matrix_csv(os.path.join(out_dir, "k_mfpt_std.csv"), k_mfpt_std)
     plot_paths: list[str] = []
     if bool(config.get("make_plots", True)):
         plot_paths = plot_rate_diagnostics(
@@ -818,14 +1502,28 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
         "thresholds": [float(x) for x in thresholds],
         "model_input": model_input_summary,
         "probability_checks": checks,
+        "rate_sanitize": rate_sanitize,
         "n_lagged_pairs": int(len(idx0)),
+        "zero_weight_mask": zero_weight_mask_stats,
+        "error_analysis": {
+            "enabled": bool(error_enabled),
+            "method": "weighted/counting standard errors plus lagged-pair slice standard deviations",
+            "requested_slices": int(error_n_slices),
+            "used_slices": int(n_error_slices_used),
+            "min_pairs_per_slice": int(error_min_pairs),
+        },
         "rate_outputs": {
             "T_hit": os.path.abspath(os.path.join(out_dir, "T_hit.npy")),
+            "k_direct_raw": os.path.abspath(os.path.join(out_dir, "k_direct_raw.npy")),
             "k_direct": os.path.abspath(os.path.join(out_dir, "k_direct.npy")),
             "K": os.path.abspath(os.path.join(out_dir, "K.npy")),
             "P_jump": os.path.abspath(os.path.join(out_dir, "P_jump.npy")),
             "MFPT": os.path.abspath(os.path.join(out_dir, "MFPT.npy")),
             "k_mfpt": os.path.abspath(os.path.join(out_dir, "k_mfpt.npy")),
+            "k_direct_std_csv": os.path.abspath(os.path.join(out_dir, "k_direct_std.csv")),
+            "P_jump_std_csv": os.path.abspath(os.path.join(out_dir, "P_jump_std.csv")),
+            "MFPT_std_csv": os.path.abspath(os.path.join(out_dir, "MFPT_std.csv")),
+            "k_mfpt_std_csv": os.path.abspath(os.path.join(out_dir, "k_mfpt_std.csv")),
         },
         "diagnostic_plots": [os.path.abspath(path) for path in plot_paths],
     }

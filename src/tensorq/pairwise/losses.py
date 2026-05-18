@@ -4,10 +4,12 @@ import torch
 
 
 def dirichlet_loss(q_t: torch.Tensor, q_tau: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
-    diff2 = (q_t - q_tau).square().mean(dim=1)
+    reduce_dtype = torch.float32 if q_t.dtype in {torch.float16, torch.bfloat16} else q_t.dtype
+    diff = q_t.to(dtype=reduce_dtype) - q_tau.to(dtype=reduce_dtype)
+    diff2 = diff.square().mean(dim=1)
     if weights is None:
         return diff2.mean()
-    w = weights.to(dtype=q_t.dtype, device=q_t.device)
+    w = weights.to(dtype=reduce_dtype, device=q_t.device)
     return torch.sum(w * diff2) / torch.clamp(torch.sum(w), min=1e-12)
 
 
@@ -32,9 +34,11 @@ def total_pairwise_committor_loss(
     weights: torch.Tensor | None = None,
     lambda_dirichlet: float = 1.0,
     lambda_endpoint: float = 100.0,
+    weighted_dirichlet: bool = True,
     weighted_endpoint: bool = False,
 ) -> dict[str, torch.Tensor]:
-    d = dirichlet_loss(q_t, q_tau, weights=weights)
+    dirichlet_weights = weights if weighted_dirichlet else None
+    d = dirichlet_loss(q_t, q_tau, weights=dirichlet_weights)
     endpoint_weights = weights if weighted_endpoint else None
     b = 0.5 * (
         endpoint_loss(q_t, pair_label_t, weights=endpoint_weights)
