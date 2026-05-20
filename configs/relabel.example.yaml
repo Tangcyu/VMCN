@@ -1,0 +1,128 @@
+# ============================================================
+# TensorQ Relabel — State-Label Confidence Diagnostics
+# ============================================================
+#
+# Usage:
+#   python scripts/diagnose.py --config configs/relabel.example.yaml
+#   python scripts/relabel.py  --config configs/relabel.example.yaml
+#   python scripts/radical.relabel.py --config configs/relabel.example.yaml
+#
+# This runs post-training diagnostics on a trained committor-vector
+# model to evaluate whether current state labels are reliable.
+# It detects split candidates, merge candidates, and missing-state
+# candidates, and generates diagnostic plots in CV space.
+
+RELABEL:
+  # ---- Required inputs ----
+  # Dataset produced by TENSORQ_LABEL (dataset.pt or dataset.npz).
+  dataset: "./dataset_out/dataset.pt"
+  dataset_path: "./dataset_out/dataset.pt"   # alias
+
+  # Trained model checkpoint (TorchScript or next_hit best_checkpoint.pt).
+  model: "./next_hit_train/next_hit_committor_best_checkpoint.pt"
+
+  # ---- Output ----
+  output_dir: "./relabel"
+  out_dir: "./relabel"                       # alias
+
+  # ---- Device and inference ----
+  device: "cuda:0"
+  batch_size: 65536
+  dataset_stride: 1
+
+  # Optional explicit state count (null infers from dataset metadata).
+  n_states: null
+
+  # Model input-space options when model is a checkpoint.
+  model_input_space: "features"              # "features" or "cv"
+  cvs_to_use: []
+  periodic_cvs: false
+  periodic_cv_units: "degrees"
+
+  # ---- Diagnostics ----
+  diagnostics:
+    compute_kinetics: false
+    profile_timing: true
+
+  output:
+    save_per_frame_csv: false
+    save_per_frame_npz: false
+    save_q_values: true
+
+  relabel:
+    write_relabel_dataset: true
+    output_dataset: "./relabel/relabeled_dataset.pt"
+    reassign_q_cutoff: 0.7
+    missing_qmax_cutoff: 0.7
+    mark_ambiguous_as_unlabeled: false
+    max_review_frames: 20000
+    make_relabel_plots: true
+    plot_unlabeled: false
+    max_plot_highlight_points: 20000
+
+  radical:
+    write_relabel_dataset: true
+    output_dataset: "./relabel/radical_relabeled_dataset.pt"
+    compact_labels: true
+    remove_problem_fraction_cutoff: 0.9
+    candidate_entropy_cutoff: 0.5
+    candidate_qmax_cutoff: 0.7
+    candidate_logic: "and"
+    top2_min_probability: 0.2
+    top2_margin_cutoff: 0.2
+    graph_space: "cv"
+    k_neighbors: 20
+    max_graph_frames: 200000
+    min_new_core_size: 100
+    min_new_core_weight: 0.0
+    density_core_enabled: true
+    density_core_fraction: 0.5
+    density_k_neighbors: 20
+    density_radius_power: 3.0
+    merge_mixed_new_states: true
+    merge_lag_list: [1, 2, 5, 10, 20]
+    merge_transition_cutoff: 0.05
+    merge_require_bidirectional: true
+    merge_min_valid_pairs: 50
+    merge_max_iterations: 100
+    random_seed: 0
+    make_relabel_plots: true
+    max_plot_highlight_points: 20000
+    max_review_frames: 20000
+
+  # ---- Plotting ----
+  make_plots: true
+  format: "png"
+
+  # CV plane for diagnostic plots (2 or 3 CV column names).
+  # Empty uses the first two CV columns found in the dataset.
+  planes: []
+  cv_plane: []                               # alias
+
+  # Plot appearance.
+  max_scatter_points: 20000
+  scatter_alpha: 0.35
+  scatter_size: 3.0
+  histogram_bins: 50
+  basin_cmap: "tab10"
+  3d_elev: 24.0
+  3d_azim: -60.0
+
+  # State naming for plot legends.
+  state_names: null
+
+  # ---- Confidence thresholds ----
+  confidence:
+    entropy_cutoff_ambiguous: 0.5
+    confidence_cutoff_high: 0.8
+    q_label_cutoff: 0.7
+    state_fraction_low_cutoff: 0.2
+    state_mean_q_cutoff: 0.75
+    reassign_dominance_cutoff: 0.65
+
+  # ---- Optional kinetic estimation ----
+  kinetics:
+    lag_list: [1, 2, 5, 10, 20]
+    min_valid_pairs: 50
+    retention_cutoff: 0.6
+    q_autocorr_cutoff: 0.5

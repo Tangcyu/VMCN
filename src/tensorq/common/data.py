@@ -200,14 +200,30 @@ def select_model_inputs(pack: CommittorDatasetPack, config: dict[str, Any]) -> t
 
 
 def infer_n_states(pack: CommittorDatasetPack, requested: int | None = None) -> int:
-    if requested is not None:
-        return int(requested)
-    if "k_selected" in pack.meta and pack.meta["k_selected"] is not None:
-        return int(pack.meta["k_selected"])
     labeled = pack.state[pack.state >= 0]
-    if labeled.numel() == 0:
+    label_n_states = int(labeled.max().item()) + 1 if labeled.numel() else None
+    if requested is not None:
+        requested = int(requested)
+        if label_n_states is not None and requested < label_n_states:
+            raise ValueError(
+                f"Requested n_states={requested}, but dataset labels require at least {label_n_states} "
+                f"(max label {label_n_states - 1})."
+            )
+        return requested
+
+    meta_n_states = None
+    if "k_selected" in pack.meta and pack.meta["k_selected"] is not None:
+        meta_n_states = int(pack.meta["k_selected"])
+    elif "n_states" in pack.meta and pack.meta["n_states"] is not None:
+        meta_n_states = int(pack.meta["n_states"])
+
+    if meta_n_states is not None and label_n_states is not None:
+        return max(meta_n_states, label_n_states)
+    if meta_n_states is not None:
+        return meta_n_states
+    if label_n_states is None:
         raise RuntimeError("Cannot infer n_states: provide it in the config or include labeled meta_state values.")
-    return int(labeled.max().item()) + 1
+    return label_n_states
 
 
 def build_lagged_indices(

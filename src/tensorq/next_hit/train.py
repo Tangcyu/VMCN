@@ -38,6 +38,24 @@ def clone_model_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     return {key: value.detach().clone() for key, value in model.state_dict().items()}
 
 
+def validate_state_labels(state: torch.Tensor, n_states: int, dataset_path: str) -> None:
+    state_cpu = state.detach().cpu().long()
+    labeled = state_cpu[state_cpu >= 0]
+    if labeled.numel() == 0:
+        return
+    min_label = int(labeled.min().item())
+    max_label = int(labeled.max().item())
+    if min_label < 0 or max_label >= int(n_states):
+        counts = torch.bincount(labeled, minlength=max(max_label + 1, int(n_states))).cpu().numpy()
+        nonzero = [(idx, int(count)) for idx, count in enumerate(counts) if count]
+        raise ValueError(
+            f"Dataset labels in {dataset_path} are outside n_states={n_states}: "
+            f"valid labeled range is [{min_label}, {max_label}]. "
+            f"Set n_states >= {max_label + 1} or regenerate the relabeled dataset metadata. "
+            f"Observed labeled counts: {nonzero}"
+        )
+
+
 class GpuLaggedBatcher:
     def __init__(
         self,
@@ -342,6 +360,7 @@ def train_next_hit_committor(config: dict[str, Any]) -> dict[str, Any]:
     dataset_path = config["dataset_path"]
     pack = apply_stride(load_dataset(dataset_path), int(config.get("dataset_stride", 1)))
     n_states = infer_n_states(pack, config.get("n_states", None))
+    validate_state_labels(pack.state, n_states, str(dataset_path))
     model_features, input_meta = select_model_inputs(pack, config)
     n_frames, in_dim = model_features.shape
 
