@@ -3,9 +3,8 @@
 # ============================================================
 #
 # Usage:
-#   python scripts/diagnose.py --config configs/relabel.example.yaml
+#   python scripts/relabel_diagnose.py --config configs/relabel.example.yaml
 #   python scripts/relabel.py  --config configs/relabel.example.yaml
-#   python scripts/radical.relabel.py --config configs/relabel.example.yaml
 #
 # This runs post-training diagnostics on a trained committor-vector
 # model to evaluate whether current state labels are reliable.
@@ -39,9 +38,27 @@ RELABEL:
   periodic_cvs: false
   periodic_cv_units: "degrees"
 
+  # ---- Shared diagnose/relabel decisions ----
+  # These are the main knobs. Older confidence/kinetics/uncertainty keys still
+  # work as compatibility fallbacks, but new configs should start here.
+  analysis:
+    lag_list: [1, 2, 5, 10, 20]
+    q_cutoff: 0.7              # committed if q_max >= q_cutoff.
+    entropy_cutoff: 0.5        # uncertain if H_norm >= entropy_cutoff.
+    lagged_entropy_cutoff: 0.5 # high H_tau if H_norm(x_{t+tau}) >= this.
+    lagged_qmax_cutoff: 0.7    # retained for diagnostics/backward-compatible summaries.
+    core_cutoff: 0.8           # high-confidence core for splitting existing labels.
+    min_count: 50              # minimum lagged-pair/group support.
+    persistent_fraction: 0.5   # persistent uncertain frames are missing-state review candidates.
+    eigengap: 0.05             # local spectral-MSM split threshold.
+    max_groups: 6
+    min_group_size: 50
+    min_slow_eigenvalue: 0.8
+    random_seed: 0
+
   # ---- Diagnostics ----
   diagnostics:
-    compute_kinetics: false
+    compute_lagged_entropy: true
     profile_timing: true
 
   output:
@@ -50,45 +67,70 @@ RELABEL:
     save_q_values: true
 
   relabel:
+    # Dataset writing and bookkeeping.
     write_relabel_dataset: true
     output_dataset: "./relabel/relabeled_dataset.pt"
-    reassign_q_cutoff: 0.7
-    missing_qmax_cutoff: 0.7
-    mark_ambiguous_as_unlabeled: false
-    max_review_frames: 20000
-    make_relabel_plots: true
-    plot_unlabeled: false
-    max_plot_highlight_points: 20000
-
-  radical:
-    write_relabel_dataset: true
-    output_dataset: "./relabel/radical_relabeled_dataset.pt"
     compact_labels: true
+    max_review_frames: 20000
+
+    # Existing-label cleanup before adding new labels. Slow-mode split groups
+    # smaller than min_new_core_size are dropped to -1 instead of new labels.
     remove_problem_fraction_cutoff: 0.9
-    candidate_entropy_cutoff: 0.5
-    candidate_qmax_cutoff: 0.7
-    candidate_logic: "and"
-    top2_min_probability: 0.2
-    top2_margin_cutoff: 0.2
-    graph_space: "cv"
+    reshape_existing_basins: true
+
+    # H(x) candidate selection uses analysis.entropy_cutoff; H_tau candidate
+    # classification uses analysis.lagged_entropy_cutoff.
+    candidate_lag_list: [1, 2, 5, 10, 20]
+
+    # Missing-metastate clustering. graph_space:auto follows model_input_space
+    # when available; otherwise it uses CVs.
+    graph_space: auto
+    random_seed: 0
+    max_graph_frames: 20000
     k_neighbors: 20
-    max_graph_frames: 200000
     min_new_core_size: 100
-    min_new_core_weight: 0.0
-    density_core_enabled: true
     density_core_fraction: 0.5
-    density_k_neighbors: 20
-    density_radius_power: 3.0
+
+    # Merge newly created labels if they exchange strongly at lag time.
     merge_mixed_new_states: true
     merge_lag_list: [1, 2, 5, 10, 20]
     merge_transition_cutoff: 0.05
-    merge_require_bidirectional: true
-    merge_min_valid_pairs: 50
-    merge_max_iterations: 100
-    random_seed: 0
+
+    # kNN backend. auto uses Torch/CUDA below size limits and sklearn otherwise.
+    knn_backend: auto        # auto | torch | cuda | sklearn
+
+    # Relabel plots.
     make_relabel_plots: true
-    max_plot_highlight_points: 20000
-    max_review_frames: 20000
+    plot_unlabeled: false
+
+  # ---- Existing-basin kinetic reshaping ----
+  basin_kinetic_groups:
+    enabled: true
+    lag_list: [1, 2, 5, 10, 20]
+    analysis_lag: null
+    q_core_cutoff: 0.8
+    q_core_mode: "own_high"
+    require_q_argmax: true
+    min_group_size: 50
+    min_group_weight: 0.0
+    min_valid_pairs: 50
+    min_microstates: 8
+    max_microstates: 100
+    target_frames_per_microstate: 500
+    min_frames_per_microstate: 20
+    max_core_frames: 200000
+    microstate_batch_size: 8192
+    microstate_n_init: 5
+    min_macro_groups: 1
+    max_macro_groups: 6
+    min_slow_eigenvalue: 0.8
+    min_eigengap: 0.05
+    strong_eigengap: 0.12
+    # Drop a proposed split group to -1 if its weight fraction among the
+    # split groups is below this cutoff, e.g. 0.99/0.01 drops the 0.01 group.
+    min_split_core_weight_fraction: 0.1
+    split_on_slow_mode_without_eigengap: true
+    random_seed: 0
 
   # ---- Plotting ----
   make_plots: true
@@ -110,19 +152,3 @@ RELABEL:
 
   # State naming for plot legends.
   state_names: null
-
-  # ---- Confidence thresholds ----
-  confidence:
-    entropy_cutoff_ambiguous: 0.5
-    confidence_cutoff_high: 0.8
-    q_label_cutoff: 0.7
-    state_fraction_low_cutoff: 0.2
-    state_mean_q_cutoff: 0.75
-    reassign_dominance_cutoff: 0.65
-
-  # ---- Optional kinetic estimation ----
-  kinetics:
-    lag_list: [1, 2, 5, 10, 20]
-    min_valid_pairs: 50
-    retention_cutoff: 0.6
-    q_autocorr_cutoff: 0.5

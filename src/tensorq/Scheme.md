@@ -62,8 +62,7 @@ tensorq/
       ┌──────▼──────┐
       │  relabel/   │
       │ diagnostics,│
-      │ apply,      │
-      │ radical     │
+      │ relabel     │
       └─────────────┘
 ```
 
@@ -108,7 +107,7 @@ refined paths, pathway network, exchange statistics
 NextHitCommittorNet checkpoint + dataset
     ↓ relabel/main.py (diagnose)
 diagnostic_summary.json, relabel_hints.csv
-    ↓ relabel/apply.py (conservative) or relabel/radical.py (aggressive)
+    ↓ relabel/relabel.py
 relabeled_dataset.pt
     ↓ retrain model with improved labels
 ```
@@ -221,6 +220,6 @@ Both `NextHitCommittorNet` and `PairwiseCommittorNet` share:
 - `gradpath/runner.py` has an uncalled `_project_paths_if_needed` function.
 - `gradpath/cluster.py` has ~100 lines duplicated between `cluster_paths` and `cluster_paths_with_linkage`.
 - `voronoi_merge/iterative.py` inlines plotting code in the main algorithm loop.
-- The conservative relabel wrapper script is named `relabe_conservel.py` (typo).
+- Relabeling now uses a single `scripts/relabel.py` entry point.
 - `next_hit/rate_constant.py` is ~1500 lines and mixes estimation, error analysis, CSV writing, and plotting.
 - No test suite exists in the repository.

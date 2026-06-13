@@ -6,7 +6,7 @@ This note describes the multi-state next-hit committor workflow in `tensorq.next
 
 The next-hit committor model predicts `q_i(x)`, the probability that configuration `x` reaches state `i` before any other labeled state. The output is a normalized probability vector over all `n_states` (via softmax or positive-L1). This is the primary committor formulation in TensorQ — the pairwise formulation in `tensorq.pairwise` is an alternative approach.
 
-The training loss combines three terms: a **Dirichlet loss** on lagged pairs that enforces the Chapman-Kolmogorov property, a **boundary loss** that anchors labeled frames to their known states, and an optional **flux consistency loss** that penalizes variance in the reactive flux profile across isocommittor surfaces.
+The training loss combines a **Dirichlet loss** on lagged pairs that enforces the Chapman-Kolmogorov property, a **boundary loss** that anchors labeled frames to their known states, an optional **simplex loss** for output normalization diagnostics, and an optional **flux consistency loss** that penalizes variance in the reactive flux profile across isocommittor surfaces.
 
 ## Entry Points
 
@@ -54,7 +54,7 @@ Code path: `train.py:main()` → `train_next_hit_committor(config)`.
 4. Instantiate `NextHitCommittorNet`, optimizer (Adam), optional AMP GradScaler.
 5. Optionally pre-load all data to GPU via `GpuLaggedBatcher`.
 6. For each epoch, `run_epoch()` computes:
-   - `total_committor_loss`: `lambda_dir * dirichlet_loss + lambda_bc * boundary_loss + lambda_flux * flux_consistency_loss`
+   - `total_committor_loss`: `lambda_dir * dirichlet_loss + lambda_bc(epoch) * boundary_loss + lambda_simplex * simplex_loss + lambda_flux * flux_consistency_loss`
    - Optional `endpoint_boundary_loss` when both t and t+tau frames are labeled.
    - Metrics: `endpoint_boundary_accuracy`, `mean_entropy`, `normalization_error`.
 7. Early stopping on validation loss with patience.
@@ -65,6 +65,8 @@ Code path: `train.py:main()` → `train_next_hit_committor(config)`.
 - **Dirichlet loss**: Penalizes deviation from the Chapman-Kolmogorov identity `q(t) ≈ q(t+tau)` for unlabeled lagged pairs.
 - **Boundary loss**: Anchors labeled frames to their state via cross-entropy or MSE on `q[state_label]`.
 - **Endpoint boundary loss**: When both t and t+tau frames are labeled, enforces that the t+tau label matches the committor prediction at t.
+- **Boundary-restraint annealing**: Optional diagnostic mode controlled by `loss.lambda_bc_schedule`. When enabled, the boundary weight stays at `lambda_initial` until `start_epoch`, then decays toward `lambda_final` by an exponential, linear, or cosine schedule. The default is fixed `lambda_bc`.
+- **Simplex loss**: Optional penalty on probability-vector normalization and non-negativity. It is disabled by default because the model normally enforces the simplex through its output normalization.
 - **Flux consistency loss** (flux.py → losses.py): For each ordered pair (i, j), bins the reactive current `C_ij` across isocommittor thresholds and penalizes variance. This enforces that the committor produces smooth, physically meaningful flux profiles.
 
 ## Inference Workflow
@@ -148,8 +150,9 @@ Code path: `label.py:main()` → `run(config)`.
 - `val_ratio`, `val_metric`
 
 **Loss weights**:
-- `lambda_dir`, `lambda_bc`, `lambda_flux`
-- `weighted_dirichlet`, `weighted_boundary`, `weighted_flux`
+- `lambda_dir`, `lambda_bc`, `lambda_simplex`, `lambda_flux`
+- `lambda_bc_schedule`: optional mapping with `enabled`, `mode`, `lambda_initial`, `lambda_final`, `start_epoch`, and `decay_epochs`; disabled by default for fixed-lambda training.
+- `weighted_dirichlet`, `weighted_boundary`, `weighted_simplex`, `weighted_flux`
 - `boundary_mode`: `"ce"` or `"mse"`
 
 **Rate estimation**:

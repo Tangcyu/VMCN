@@ -41,6 +41,12 @@ def _write_csv(filepath: str, rows: list[dict]) -> None:
             pass
         return
     fieldnames = list(rows[0].keys())
+    seen = set(fieldnames)
+    for row in rows[1:]:
+        for key in row.keys():
+            if key not in seen:
+                fieldnames.append(key)
+                seen.add(key)
     with open(filepath, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
@@ -165,6 +171,8 @@ def save_results(
     summary["merge_candidates"] = results.get("merge_candidates", [])
     summary["missing_state_candidates"] = results.get("missing_state_candidates", [])
     summary["relabel_hints"] = results.get("relabel_hints", [])
+    summary["basin_kinetic_state_stats"] = results.get("basin_kinetic_state_stats", [])
+    summary["basin_kinetic_groups"] = results.get("basin_kinetic_groups", [])
 
     with open(os.path.join(output_dir, "diagnostic_summary.json"), "w") as fh:
         json.dump(_ensure_json_serializable(summary), fh, indent=2)
@@ -179,6 +187,15 @@ def save_results(
     _write_csv(
         os.path.join(output_dir, "relabel_hints.csv"),
         results.get("relabel_hints", []),
+    )
+
+    _write_csv(
+        os.path.join(output_dir, "basin_kinetic_state_summary.csv"),
+        results.get("basin_kinetic_state_stats", []),
+    )
+    _write_csv(
+        os.path.join(output_dir, "basin_kinetic_groups.csv"),
+        results.get("basin_kinetic_groups", []),
     )
 
     # These files were produced by the old clustering-based candidate detector.

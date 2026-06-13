@@ -6,11 +6,23 @@ Evaluates whether current state labels are reliable by analyzing:
 - committor entropy/confidence
 - q-argmax alternatives for low-consistency frames
 
-Split/merge/missing-state decisions are intentionally not automated here.
-Use the relabel hint table for triage, then validate candidate label changes
-with targeted structural/CV inspection and retraining.
+Large disconnected kinetic groups inside the same high-confidence label core
+are reported as basin-internal metastability signals.
 """
 
-from .label_diagnostics import DEFAULT_CONFIG, StateLabelDiagnostics, run_label_diagnostics, run_relabel
+from .label_diagnostics import (
+    DEFAULT_CONFIG,
+    StateLabelDiagnostics,
+    run_label_diagnostics,
+    run_relabel as run_diagnostics,
+)
+from .relabel import propose_relabeling, run_relabel
 
-__all__ = ["StateLabelDiagnostics", "run_label_diagnostics", "run_relabel", "DEFAULT_CONFIG"]
+__all__ = [
+    "StateLabelDiagnostics",
+    "run_label_diagnostics",
+    "run_diagnostics",
+    "run_relabel",
+    "propose_relabeling",
+    "DEFAULT_CONFIG",
+]

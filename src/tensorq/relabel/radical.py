@@ -17,6 +17,7 @@ from .apply import (
     plot_relabel_cv,
 )
 from .lag_pair_utils import build_lag_pairs
+from .settings import analysis_settings
 
 
 def _standardize_features(x):
@@ -514,13 +515,12 @@ def propose_radical_relabeling(
     trajectory_index=None,
     frame_index=None,
 ):
-    confidence_cfg = config.get("confidence", {})
     radical_cfg = config.get("radical", {})
+    settings = analysis_settings(config)
 
-    q_label_cutoff = float(confidence_cfg.get("q_label_cutoff", 0.7))
-    entropy_cutoff = float(confidence_cfg.get("entropy_cutoff_ambiguous", 0.5))
+    q_label_cutoff = float(settings["q_cutoff"])
+    entropy_cutoff = float(settings["entropy_cutoff"])
     remove_cutoff = float(radical_cfg.get("remove_problem_fraction_cutoff", 0.9))
-    candidate_entropy_cutoff = float(radical_cfg.get("candidate_entropy_cutoff", entropy_cutoff))
     candidate_qmax_cutoff = float(radical_cfg.get("candidate_qmax_cutoff", q_label_cutoff))
     candidate_logic = str(radical_cfg.get("candidate_logic", "and")).lower()
     top2_min_probability = float(radical_cfg.get("top2_min_probability", 0.2))
@@ -564,7 +564,7 @@ def propose_radical_relabeling(
                 "reason": "state removed because most frames are low-consistency or high-entropy",
             })
 
-    uncertain = entropy_norm >= candidate_entropy_cutoff
+    uncertain = entropy_norm >= entropy_cutoff
     weak_destination = q_max <= candidate_qmax_cutoff
     if candidate_logic == "or":
         uncertain_candidate = uncertain | weak_destination

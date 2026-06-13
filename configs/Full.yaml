@@ -292,6 +292,20 @@ NEXT_HIT_COMMITTOR:
     # Boundary condition weight on labeled metastable endpoints.
     lambda_bc: 10.0
 
+    # Optional boundary-restraint annealing for label-consistency diagnostics.
+    # Keep disabled for fixed-lambda production/default training.
+    lambda_bc_schedule:
+      enabled: false
+      mode: "exponential"        # "fixed", "exponential", "linear", or "cosine"
+      lambda_initial: 100.0
+      lambda_final: 10.0
+      start_epoch: 1
+      decay_epochs: 100
+
+    # Optional simplex penalty. Softmax/positive_l1 outputs are already normalized,
+    # so the default keeps this term inactive.
+    lambda_simplex: 0.0
+
     # Flux-profile flatness/consistency weight.
     lambda_flux: 0.1
 
@@ -301,6 +315,7 @@ NEXT_HIT_COMMITTOR:
     # Weight samples in each loss term by dataset weights.
     weighted_dirichlet: true
     weighted_boundary: false
+    weighted_simplex: false
     weighted_flux: true
 
     # Flux threshold grid. Set thresholds to an explicit list to override.

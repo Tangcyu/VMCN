@@ -7,15 +7,52 @@ from copy import deepcopy
 import numpy as np
 
 from .diagnostics_io import save_results
-from .lag_pair_utils import (
-    build_lag_pairs,
-    summarize_label_kinetics,
-)
+from .kinetic_groups import analyze_basin_kinetic_groups
+from .lag_pair_utils import build_lag_pairs
+from .settings import analysis_settings
+
+
+UNCERTAINTY_CATEGORY_CODES = {
+    "stable": 0,
+    "mislabeled_metastate": 1,
+    "missed_metastate": 2,
+    "transition_state": 3,
+    "unresolved_uncertain": 4,
+}
+UNCERTAINTY_CATEGORY_NAMES = {
+    value: key for key, value in UNCERTAINTY_CATEGORY_CODES.items()
+}
+
+
+def _nanmean_by_frame(values):
+    values = np.asarray(values, dtype=np.float64)
+    finite = np.isfinite(values)
+    counts = np.sum(finite, axis=0)
+    sums = np.where(finite, values, 0.0).sum(axis=0)
+    out = np.full(values.shape[1], np.nan, dtype=np.float64)
+    valid = counts > 0
+    out[valid] = sums[valid] / counts[valid]
+    return out
+
 
 DEFAULT_CONFIG = {
     "output_dir": "diagnostics",
+    "analysis": {
+        "lag_list": [1, 2, 5, 10, 20],
+        "q_cutoff": 0.7,
+        "entropy_cutoff": 0.5,
+        "core_cutoff": 0.8,
+        "min_count": 50,
+        "persistent_fraction": 0.5,
+        "eigengap": 0.05,
+        "max_groups": 6,
+        "min_group_size": 50,
+        "random_seed": 0,
+    },
     "diagnostics": {
+        "compute_lagged_entropy": False,
         "compute_kinetics": False,
+        "compute_basin_kinetic_groups": True,
         "profile_timing": False,
     },
     "output": {
@@ -34,8 +71,34 @@ DEFAULT_CONFIG = {
     "kinetics": {
         "lag_list": [1, 2, 5, 10, 20],
         "min_valid_pairs": 50,
-        "retention_cutoff": 0.6,
-        "q_autocorr_cutoff": 0.5,
+    },
+    "basin_kinetic_groups": {
+        "enabled": True,
+        "q_core_mode": "own_high",
+        "q_core_cutoff": 0.8,
+        "require_q_argmax": True,
+        "min_group_size": 50,
+        "min_group_weight": 0.0,
+        "min_valid_pairs": 50,
+        "max_core_frames": 200000,
+        "random_seed": 0,
+        "analysis_lag": None,
+        "min_microstates": 8,
+        "max_microstates": 100,
+        "target_frames_per_microstate": 500,
+        "min_frames_per_microstate": 20,
+        "max_macro_groups": 6,
+        "min_slow_eigenvalue": 0.8,
+        "min_eigengap": 0.05,
+        "strong_eigengap": 0.12,
+        "lag_list": None,
+    },
+    "uncertainty": {
+        "lagged_entropy_cutoff": 0.5,
+        "entropy_relief_cutoff": 0.15,
+        "top2_min_probability": 0.2,
+        "top2_margin_cutoff": 0.2,
+        "min_category_fraction": 0.05,
     },
 }
 
@@ -85,6 +148,36 @@ class StateLabelDiagnostics:
         self.split_candidates = []
         self.merge_candidates = []
         self.missing_state_candidates = []
+        self.basin_kinetic_state_stats = []
+        self.basin_kinetic_groups = []
+        self.basin_kinetic_group_labels = None
+
+    def _compute_lagged_entropy_enabled(self):
+        diagnostics_cfg = self.config.get("diagnostics", {})
+        return bool(
+            diagnostics_cfg.get(
+                "compute_lagged_entropy",
+                diagnostics_cfg.get("compute_kinetics", False),
+            )
+        )
+
+    def _compute_basin_kinetic_groups_enabled(self):
+        diagnostics_cfg = self.config.get("diagnostics", {})
+        group_cfg = self.config.get("basin_kinetic_groups", {})
+        return bool(
+            diagnostics_cfg.get(
+                "compute_basin_kinetic_groups",
+                group_cfg.get("enabled", True),
+            )
+        )
+
+    def _lag_list(self):
+        lag_cfg = self.config.get("lagged_entropy", {})
+        settings = analysis_settings(self.config)
+        lag_list = lag_cfg.get("lag_list", settings["lag_list"])
+        if isinstance(lag_list, (int, float)):
+            lag_list = [lag_list]
+        return [int(lag) for lag in lag_list if int(lag) > 0]
 
     def _init_config(self, config):
         cfg = deepcopy(DEFAULT_CONFIG)
@@ -102,7 +195,8 @@ class StateLabelDiagnostics:
         q_max = np.max(q, axis=1)
         q_argmax = np.argmax(q, axis=1).astype(np.int64)
         q_entropy = -np.sum(q * np.log(q), axis=1)
-        q_entropy_norm = q_entropy / np.log(q.shape[1])
+        entropy_norm_denominator = np.log(q.shape[1]) if q.shape[1] > 1 else 1.0
+        q_entropy_norm = q_entropy / entropy_norm_denominator
         committor_confidence = 1.0 - q_entropy_norm
 
         self.per_frame["q_max"] = q_max
@@ -125,27 +219,182 @@ class StateLabelDiagnostics:
         consistency[valid] = self.q_values[idx, self.core_state_labels[valid]]
         self.per_frame["core_label_consistency"] = consistency
 
+    def compute_lagged_committor_entropy(self):
+        if not self.lag_pairs:
+            return
+
+        lagged_entropy_fields = []
+        lagged_qmax_fields = []
+        current_entropy = self.per_frame["q_entropy_norm"]
+
+        for lag in self._lag_list():
+            if lag not in self.lag_pairs:
+                continue
+            idx_t, idx_tau = self.lag_pairs[lag]
+            lagged_entropy = np.full(self.n_frames, np.nan, dtype=np.float64)
+            lagged_delta = np.full(self.n_frames, np.nan, dtype=np.float64)
+            lagged_qmax = np.full(self.n_frames, np.nan, dtype=np.float64)
+            lagged_qargmax = np.full(self.n_frames, -1, dtype=np.int64)
+
+            lagged_entropy[idx_t] = current_entropy[idx_tau]
+            lagged_delta[idx_t] = current_entropy[idx_tau] - current_entropy[idx_t]
+            lagged_qmax[idx_t] = self.per_frame["q_max"][idx_tau]
+            lagged_qargmax[idx_t] = self.per_frame["q_argmax"][idx_tau]
+
+            entropy_key = f"lagged_q_entropy_norm_lag_{lag}"
+            qmax_key = f"lagged_q_max_lag_{lag}"
+            self.per_frame[entropy_key] = lagged_entropy
+            self.per_frame[f"lagged_q_entropy_delta_lag_{lag}"] = lagged_delta
+            self.per_frame[qmax_key] = lagged_qmax
+            self.per_frame[f"lagged_q_argmax_lag_{lag}"] = lagged_qargmax
+            lagged_entropy_fields.append(lagged_entropy)
+            lagged_qmax_fields.append(lagged_qmax)
+
+        if lagged_entropy_fields:
+            entropy_stack = np.vstack(lagged_entropy_fields)
+            mean_lagged_entropy = _nanmean_by_frame(entropy_stack)
+            self.per_frame["mean_lagged_q_entropy_norm"] = mean_lagged_entropy
+            self.per_frame["mean_lagged_q_entropy_delta"] = (
+                mean_lagged_entropy - current_entropy
+            )
+
+        if lagged_qmax_fields:
+            qmax_stack = np.vstack(lagged_qmax_fields)
+            self.per_frame["mean_lagged_q_max"] = _nanmean_by_frame(qmax_stack)
+
+    def classify_uncertainty_regions(self):
+        settings = analysis_settings(self.config)
+        cfg = self.config["confidence"]
+        uncertainty_cfg = self.config.get("uncertainty", {})
+        q_label_cutoff = float(settings["q_cutoff"])
+        entropy_cutoff = float(settings["entropy_cutoff"])
+        lagged_entropy_cutoff = float(
+            settings["lagged_entropy_cutoff"]
+        )
+        entropy_relief_cutoff = float(uncertainty_cfg.get("entropy_relief_cutoff", 0.15))
+        top2_min_probability = float(uncertainty_cfg.get("top2_min_probability", 0.2))
+        top2_margin_cutoff = float(uncertainty_cfg.get("top2_margin_cutoff", 0.2))
+
+        q_max = self.per_frame["q_max"]
+        q_argmax = self.per_frame["q_argmax"]
+        q = self.q_values
+        if self.n_states == 1:
+            top2_idx = np.column_stack([q_argmax, np.full(self.n_frames, -1, dtype=np.int64)])
+            top2_probs = np.column_stack([q_max, np.zeros(self.n_frames, dtype=np.float64)])
+        else:
+            top2_idx = np.argpartition(q, -2, axis=1)[:, -2:]
+            top2_probs = np.take_along_axis(q, top2_idx, axis=1)
+            order = np.argsort(-top2_probs, axis=1)
+            top2_idx = np.take_along_axis(top2_idx, order, axis=1)
+            top2_probs = np.take_along_axis(top2_probs, order, axis=1)
+
+        entropy = self.per_frame["q_entropy_norm"]
+        label_consistency = self.per_frame["label_consistency"]
+        has_lagged_entropy = "mean_lagged_q_entropy_norm" in self.per_frame
+        lagged_entropy = self.per_frame.get("mean_lagged_q_entropy_norm", entropy)
+        lagged_qmax = self.per_frame.get("mean_lagged_q_max", q_max)
+
+        valid_label = self.state_labels >= 0
+        low_consistency = (
+            valid_label
+            & np.isfinite(label_consistency)
+            & (label_consistency < q_label_cutoff)
+        )
+        high_entropy = entropy >= entropy_cutoff
+        persistent_high_entropy = (
+            has_lagged_entropy
+            &
+            np.isfinite(lagged_entropy)
+            & (lagged_entropy >= lagged_entropy_cutoff)
+        )
+        entropy_relief = (
+            has_lagged_entropy
+            &
+            np.isfinite(lagged_entropy)
+            & ((entropy - lagged_entropy) >= entropy_relief_cutoff)
+        )
+        lagged_committed = (
+            has_lagged_entropy
+            & np.isfinite(lagged_qmax)
+            & (lagged_qmax >= q_label_cutoff)
+        )
+        two_state_mixture = (
+            (top2_probs[:, 1] >= top2_min_probability)
+            & ((top2_probs[:, 0] - top2_probs[:, 1]) <= top2_margin_cutoff)
+        )
+        confident_other_label = (
+            valid_label
+            & low_consistency
+            & (q_argmax != self.state_labels)
+            & (q_max >= q_label_cutoff)
+        )
+
+        category = np.full(
+            self.n_frames,
+            UNCERTAINTY_CATEGORY_CODES["stable"],
+            dtype=np.int64,
+        )
+        category[high_entropy | low_consistency] = UNCERTAINTY_CATEGORY_CODES[
+            "unresolved_uncertain"
+        ]
+
+        missed_metastate = (
+            high_entropy
+            & persistent_high_entropy
+            & (q_max < q_label_cutoff)
+            & ~two_state_mixture
+        )
+        transition_state = (
+            high_entropy
+            & two_state_mixture
+            & entropy_relief
+            & lagged_committed
+        )
+
+        category[missed_metastate] = UNCERTAINTY_CATEGORY_CODES["missed_metastate"]
+        category[transition_state] = UNCERTAINTY_CATEGORY_CODES["transition_state"]
+        category[confident_other_label] = UNCERTAINTY_CATEGORY_CODES[
+            "mislabeled_metastate"
+        ]
+
+        self.per_frame["uncertainty_category"] = category
+        self.per_frame["top1_state"] = top2_idx[:, 0].astype(np.int64, copy=False)
+        self.per_frame["top2_state"] = top2_idx[:, 1].astype(np.int64, copy=False)
+        self.per_frame["top1_probability"] = top2_probs[:, 0]
+        self.per_frame["top2_probability"] = top2_probs[:, 1]
+        self.per_frame["top2_margin"] = top2_probs[:, 0] - top2_probs[:, 1]
+
+    def compute_basin_kinetic_groups(self):
+        if not self.lag_pairs:
+            return [], []
+        state_rows, group_rows, group_labels = analyze_basin_kinetic_groups(
+            self.state_labels,
+            self.q_values,
+            self.lag_pairs,
+            self.config,
+            weights=self.weights,
+            n_states=self.n_states,
+            features=self.features,
+        )
+        self.basin_kinetic_state_stats = state_rows
+        self.basin_kinetic_groups = group_rows
+        self.basin_kinetic_group_labels = group_labels
+        return state_rows, group_rows
+
     # ------------------------------------------------------------------
     # State-level statistics
     # ------------------------------------------------------------------
 
     def compute_state_level_statistics(self):
-        lag_list = self.config["kinetics"]["lag_list"]
-        q_label_cutoff = self.config["confidence"]["q_label_cutoff"]
-        min_valid = self.config["kinetics"]["min_valid_pairs"]
-        compute_kinetics = bool(self.config.get("diagnostics", {}).get("compute_kinetics", True))
-        kinetics = None
-        if compute_kinetics:
-            kinetics = summarize_label_kinetics(
-                self.state_labels,
-                self.q_values,
-                self.lag_pairs,
-                lag_list=lag_list,
-                weights=self.weights,
-                min_valid_pairs=min_valid,
-                n_labels=self.n_states,
-            )
+        lag_list = self._lag_list()
+        settings = analysis_settings(self.config)
+        q_label_cutoff = settings["q_cutoff"]
         rows = []
+        category = self.per_frame.get("uncertainty_category")
+        min_category_fraction = float(
+            self.config.get("uncertainty", {}).get("min_category_fraction", 0.05)
+        )
+        min_valid_pairs = int(settings["min_count"])
 
         for i in range(self.n_states):
             mask = self.state_labels == i
@@ -168,13 +417,57 @@ class StateLabelDiagnostics:
                 "median_entropy_norm": float(np.median(entropy)),
             }
 
-            if kinetics is not None:
+            if self.lag_pairs:
                 for lag in lag_list:
-                    ret = kinetics["retention"][lag][i]
-                    row[f"p_stay_lag_{lag}"] = float(ret) if not np.isnan(ret) else np.nan
+                    entropy_key = f"lagged_q_entropy_norm_lag_{lag}"
+                    delta_key = f"lagged_q_entropy_delta_lag_{lag}"
+                    if entropy_key not in self.per_frame:
+                        continue
+                    lagged_entropy = self.per_frame[entropy_key][mask]
+                    finite = np.isfinite(lagged_entropy)
+                    n_valid = int(np.sum(finite))
+                    row[f"n_lagged_pairs_lag_{lag}"] = n_valid
+                    if n_valid >= min_valid_pairs:
+                        row[f"mean_lagged_entropy_lag_{lag}"] = float(
+                            np.mean(lagged_entropy[finite])
+                        )
+                        row[f"fraction_lagged_high_entropy_lag_{lag}"] = float(
+                            np.mean(
+                                lagged_entropy[finite]
+                                >= self.config.get("uncertainty", {}).get(
+                                    "lagged_entropy_cutoff",
+                                    self.config["confidence"].get(
+                                        "entropy_cutoff_ambiguous", 0.5
+                                    ),
+                                )
+                            )
+                        )
+                    else:
+                        row[f"mean_lagged_entropy_lag_{lag}"] = np.nan
+                        row[f"fraction_lagged_high_entropy_lag_{lag}"] = np.nan
 
-                    q_ac = kinetics["q_autocorr"][lag][i]
-                    row[f"q_autocorr_lag_{lag}"] = float(q_ac) if not np.isnan(q_ac) else np.nan
+                    if delta_key in self.per_frame:
+                        delta = self.per_frame[delta_key][mask]
+                        finite_delta = np.isfinite(delta)
+                        row[f"mean_lagged_entropy_delta_lag_{lag}"] = (
+                            float(np.mean(delta[finite_delta]))
+                            if int(np.sum(finite_delta)) >= min_valid_pairs
+                            else np.nan
+                        )
+
+            if category is not None:
+                fractions = {}
+                for name, code in UNCERTAINTY_CATEGORY_CODES.items():
+                    n_category = int(np.sum(mask & (category == code)))
+                    row[f"n_{name}"] = n_category
+                    row[f"fraction_{name}"] = float(n_category / n_state)
+                    if name != "stable":
+                        fractions[name] = row[f"fraction_{name}"]
+                primary = max(fractions, key=fractions.get) if fractions else "stable"
+                if fractions and fractions[primary] >= min_category_fraction:
+                    row["primary_uncertainty_type"] = primary
+                else:
+                    row["primary_uncertainty_type"] = "stable"
 
             rows.append(row)
 
@@ -186,11 +479,12 @@ class StateLabelDiagnostics:
     # ------------------------------------------------------------------
 
     def build_relabel_hints(self):
+        settings = analysis_settings(self.config)
         cfg = self.config["confidence"]
-        q_label_cutoff = float(cfg["q_label_cutoff"])
+        q_label_cutoff = float(settings["q_cutoff"])
         frac_low_cutoff = float(cfg.get("state_fraction_low_cutoff", 0.2))
         mean_q_cutoff = float(cfg.get("state_mean_q_cutoff", 0.75))
-        entropy_cutoff = float(cfg.get("entropy_cutoff_ambiguous", 0.5))
+        entropy_cutoff = float(settings["entropy_cutoff"])
         dominance_cutoff = float(cfg.get("reassign_dominance_cutoff", 0.65))
 
         hints = []
@@ -219,8 +513,27 @@ class StateLabelDiagnostics:
                 or row["mean_q_own"] < mean_q_cutoff
             )
             ambiguous = row["mean_entropy_norm"] >= entropy_cutoff
+            primary_uncertainty = row.get("primary_uncertainty_type", "stable")
 
-            if unreliable and dominant_alt >= 0 and dominant_alt_fraction >= dominance_cutoff:
+            if primary_uncertainty == "mislabeled_metastate":
+                issue = "mislabeled_metastate"
+                next_step = (
+                    "Frames in this label are confidently assigned to a different committor basin; "
+                    "inspect/reassign those frames before adding new states."
+                )
+            elif primary_uncertainty == "missed_metastate":
+                issue = "missed_metastate_or_missing_descriptor"
+                next_step = (
+                    "High entropy persists at the lagged endpoint, so this is less transition-like; "
+                    "inspect whether these frames form a stable missing basin or require better features."
+                )
+            elif primary_uncertainty == "transition_state":
+                issue = "transition_state_like"
+                next_step = (
+                    "Entropy is high at the frame but drops at the lagged endpoint, consistent with "
+                    "a transition region between the top committor destinations."
+                )
+            elif unreliable and dominant_alt >= 0 and dominant_alt_fraction >= dominance_cutoff:
                 issue = "possible_reassignment_or_merge"
                 next_step = (
                     f"Inspect frames labeled {state} whose q-argmax is {dominant_alt}; "
@@ -252,6 +565,11 @@ class StateLabelDiagnostics:
                 "mean_q_own": float(row["mean_q_own"]),
                 "fraction_low_consistency": float(row["fraction_low_consistency"]),
                 "mean_entropy_norm": float(row["mean_entropy_norm"]),
+                "primary_uncertainty_type": primary_uncertainty,
+                "fraction_mislabeled_metastate": float(row.get("fraction_mislabeled_metastate", 0.0)),
+                "fraction_missed_metastate": float(row.get("fraction_missed_metastate", 0.0)),
+                "fraction_transition_state": float(row.get("fraction_transition_state", 0.0)),
+                "fraction_unresolved_uncertain": float(row.get("fraction_unresolved_uncertain", 0.0)),
                 "dominant_alternative_state": dominant_alt,
                 "dominant_alternative_fraction": dominant_alt_fraction,
                 "issue": issue,
@@ -295,16 +613,31 @@ class StateLabelDiagnostics:
         self.compute_core_label_consistency()
         mark("confidence_metrics", start)
 
-        compute_kinetics = bool(self.config.get("diagnostics", {}).get("compute_kinetics", True))
+        compute_lagged_entropy = self._compute_lagged_entropy_enabled()
+        compute_basin_groups = self._compute_basin_kinetic_groups_enabled()
 
-        if compute_kinetics:
+        if compute_lagged_entropy or compute_basin_groups:
             start = time.perf_counter()
             self.lag_pairs = build_lag_pairs(
                 self.trajectory_index,
                 self.frame_index,
-                self.config["kinetics"]["lag_list"],
+                self._lag_list(),
             )
             mark("build_lag_pairs", start)
+
+            if compute_lagged_entropy:
+                start = time.perf_counter()
+                self.compute_lagged_committor_entropy()
+                mark("lagged_committor_entropy", start)
+
+        if compute_basin_groups:
+            start = time.perf_counter()
+            self.compute_basin_kinetic_groups()
+            mark("basin_kinetic_groups", start)
+
+        start = time.perf_counter()
+        self.classify_uncertainty_regions()
+        mark("uncertainty_classification", start)
 
         start = time.perf_counter()
         self.compute_state_level_statistics()
@@ -328,6 +661,8 @@ class StateLabelDiagnostics:
             "split_candidates": [],
             "merge_candidates": [],
             "missing_state_candidates": [],
+            "basin_kinetic_state_stats": self.basin_kinetic_state_stats,
+            "basin_kinetic_groups": self.basin_kinetic_groups,
             "cluster_table": self.global_cluster_stats,
             "summary": summary,
         }
@@ -358,7 +693,19 @@ class StateLabelDiagnostics:
                 "median_q_own": row["median_q_own"],
                 "fraction_low_consistency": row["fraction_low_consistency"],
                 "mean_entropy_norm": row["mean_entropy_norm"],
+                "primary_uncertainty_type": row.get("primary_uncertainty_type", "stable"),
+                "fraction_mislabeled_metastate": row.get("fraction_mislabeled_metastate", 0.0),
+                "fraction_missed_metastate": row.get("fraction_missed_metastate", 0.0),
+                "fraction_transition_state": row.get("fraction_transition_state", 0.0),
+                "fraction_unresolved_uncertain": row.get("fraction_unresolved_uncertain", 0.0),
             })
+            for key, value in row.items():
+                if (
+                    key.startswith("mean_lagged_entropy")
+                    or key.startswith("fraction_lagged_high_entropy")
+                    or key.startswith("n_lagged_pairs")
+                ):
+                    state_confidence[-1][key] = value
 
         return {
             "n_frames": self.n_frames,
@@ -371,12 +718,28 @@ class StateLabelDiagnostics:
             "split_candidates": self.split_candidates,
             "merge_candidates": self.merge_candidates,
             "missing_state_candidates": self.missing_state_candidates,
+            "basin_kinetic_state_stats": self.basin_kinetic_state_stats,
+            "basin_kinetic_groups": self.basin_kinetic_groups,
             "notes": {
+                "uncertainty_category_codes": UNCERTAINTY_CATEGORY_CODES,
+                "lagged_entropy": (
+                    "Lagged entropy uses H_norm(q(x_{t+tau})) for each trajectory-safe lag pair. "
+                    "Transition-state-like regions have high current entropy that relaxes to a "
+                    "lower-entropy, committed lagged endpoint; missed-metastate-like regions keep "
+                    "high entropy after the lag; mislabeled-metastate regions have low assigned-label "
+                    "consistency but high confidence for another existing state."
+                ),
                 "candidate_detection": (
                     "Split/merge/missing-state candidate detection is intentionally disabled. "
                     "Use relabel_hints as confidence-based triage, then validate proposed changes "
                     "with targeted structural/CV inspection and retraining."
-                )
+                ),
+                "basin_kinetic_groups": (
+                    "Kinetic groups are estimated by a local spectral MSM inside each high-confidence "
+                    "label core: feature-space microstates, trajectory-safe lagged transitions, "
+                    "eigenvalue/eigengap group-count selection, then slow-eigenvector macrostate "
+                    "assignment. Multiple robust groups inside one label suggest a split."
+                ),
             },
             "config": self.config,
         }
@@ -390,13 +753,36 @@ class StateLabelDiagnostics:
             "core_state_label": self.core_state_labels,
         }
 
-        for key in ["q_argmax", "q_max", "q_entropy", "q_entropy_norm",
-                     "committor_confidence", "label_consistency", "core_label_consistency"]:
+        for key in [
+            "q_argmax",
+            "q_max",
+            "q_entropy",
+            "q_entropy_norm",
+            "committor_confidence",
+            "label_consistency",
+            "core_label_consistency",
+            "mean_lagged_q_entropy_norm",
+            "mean_lagged_q_entropy_delta",
+            "mean_lagged_q_max",
+            "uncertainty_category",
+            "top1_state",
+            "top2_state",
+            "top1_probability",
+            "top2_probability",
+            "top2_margin",
+        ]:
             if key in self.per_frame:
+                columns[key] = self.per_frame[key]
+
+        for key in sorted(self.per_frame):
+            if key.startswith("lagged_q_"):
                 columns[key] = self.per_frame[key]
 
         if self.global_cluster_labels is not None:
             columns["cluster_id"] = self.global_cluster_labels
+
+        if self.basin_kinetic_group_labels is not None:
+            columns["basin_kinetic_group"] = self.basin_kinetic_group_labels
 
         if self.weights is not None:
             columns["weight"] = self.weights

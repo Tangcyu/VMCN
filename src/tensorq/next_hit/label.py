@@ -668,19 +668,34 @@ def plot_state_centers_on_cvs(
     centroid_plot_cvs: list[str],
     out_prefix: str,
     title_prefix: str,
+    center_labels: np.ndarray | None = None,
 ) -> dict[str, Any]:
     indices, names = resolve_centroid_plot_indices(cv_headers, centroid_plot_cvs)
     center_indices, _ = resolve_centroid_plot_indices(center_cv_names, centroid_plot_cvs)
     X_plot = cv_data[:, indices].astype(np.float32)
     centers_plot = np.asarray(centers, dtype=np.float32)[:, center_indices]
-    n_states = centers_plot.shape[0]
+    if center_labels is None:
+        center_labels_arr = np.arange(centers_plot.shape[0], dtype=np.int64)
+    else:
+        center_labels_arr = np.asarray(center_labels, dtype=np.int64)
+        if center_labels_arr.shape != (centers_plot.shape[0],):
+            raise ValueError(
+                f"center_labels must have one entry per center; got shape {center_labels_arr.shape} "
+                f"for {centers_plot.shape[0]} center(s)."
+            )
 
     pairs = [(0, 1)] if len(indices) == 2 else [(0, 1), (0, 2), (1, 2)]
     paths = []
-    cmap = plt.get_cmap("tab10", max(n_states, 1))
     labels = np.asarray(meta_state, dtype=np.int64)
     intermediate = labels == -1
     labeled = labels >= 0
+    n_color_states = 1
+    if center_labels_arr.size:
+        n_color_states = max(n_color_states, int(np.max(center_labels_arr)) + 1)
+    if np.any(labeled):
+        n_color_states = max(n_color_states, int(np.max(labels[labeled])) + 1)
+    cmap = plt.get_cmap("tab10", n_color_states)
+    color_vmax = max(n_color_states - 1, 1)
 
     for i, j in pairs:
         plt.figure(figsize=(6.5, 5.5))
@@ -701,6 +716,8 @@ def plot_state_centers_on_cvs(
                 X_plot[labeled, j],
                 c=labels[labeled],
                 cmap=cmap,
+                vmin=0,
+                vmax=color_vmax,
                 s=8,
                 alpha=0.45,
                 linewidths=0,
@@ -709,17 +726,19 @@ def plot_state_centers_on_cvs(
         plt.scatter(
             centers_plot[:, i],
             centers_plot[:, j],
-            c=np.arange(n_states),
+            c=center_labels_arr,
             cmap=cmap,
+            vmin=0,
+            vmax=color_vmax,
             s=180,
             marker="X",
             edgecolors="black",
             linewidths=0.8,
         )
-        for state in range(n_states):
+        for center_idx, label in enumerate(center_labels_arr):
             plt.annotate(
-                str(state),
-                (float(centers_plot[state, i]), float(centers_plot[state, j])),
+                str(int(label)),
+                (float(centers_plot[center_idx, i]), float(centers_plot[center_idx, j])),
                 textcoords="offset points",
                 xytext=(5, 5),
                 fontsize=9,
@@ -733,7 +752,7 @@ def plot_state_centers_on_cvs(
         plt.close()
         paths.append(out_png)
 
-    return {"cvs": names, "centers": centers_plot, "paths": paths}
+    return {"cvs": names, "centers": centers_plot, "center_labels": center_labels_arr, "paths": paths}
 
 
 def coerce_basin_size(size, ndim: int) -> np.ndarray:
@@ -746,6 +765,56 @@ def coerce_basin_size(size, ndim: int) -> np.ndarray:
     if np.any(out <= 0):
         raise ValueError("Basin sizes must be positive.")
     return out
+
+
+def coerce_basin_centers(basin: dict[str, Any], idx: int, ndim: int) -> np.ndarray:
+    has_center = "center" in basin
+    has_centers = "centers" in basin
+    if has_center == has_centers:
+        key_text = "either center or centers" if not has_center else "only one of center/centers"
+        raise ValueError(f"Basin #{idx} must define {key_text}.")
+
+    raw_centers = basin["center"] if has_center else basin["centers"]
+    centers = np.asarray(raw_centers, dtype=np.float32)
+    if centers.shape == (ndim,):
+        centers = centers.reshape(1, ndim)
+    if centers.ndim != 2 or centers.shape[1] != ndim or centers.shape[0] == 0:
+        raise ValueError(
+            f"Basin #{idx} centers must have shape ({ndim},) or (n_centers, {ndim}); "
+            f"got shape {centers.shape}."
+        )
+    return centers
+
+
+def coerce_basin_sizes(size, ndim: int, n_centers: int, idx: int) -> np.ndarray:
+    if np.isscalar(size):
+        one_size = coerce_basin_size(size, ndim)
+        return np.repeat(one_size[None, :], n_centers, axis=0)
+
+    sizes = np.asarray(size, dtype=np.float32)
+    if sizes.shape == (ndim,):
+        return np.repeat(coerce_basin_size(sizes, ndim)[None, :], n_centers, axis=0)
+    if sizes.shape != (n_centers, ndim):
+        raise ValueError(
+            f"Basin #{idx} size/sizes must be scalar, length {ndim}, or shape "
+            f"({n_centers}, {ndim}); got shape {sizes.shape}."
+        )
+    if np.any(sizes <= 0):
+        raise ValueError("Basin sizes must be positive.")
+    return sizes
+
+
+def coerce_basin_cutoffs(cutoff, n_centers: int, idx: int) -> np.ndarray:
+    cutoffs = np.asarray(cutoff, dtype=np.float32)
+    if cutoffs.ndim == 0:
+        cutoffs = np.full(n_centers, float(cutoffs), dtype=np.float32)
+    if cutoffs.shape != (n_centers,):
+        raise ValueError(
+            f"Basin #{idx} cutoff/cutoffs must be scalar or length {n_centers}; got shape {cutoffs.shape}."
+        )
+    if np.any(cutoffs <= 0):
+        raise ValueError(f"Basin #{idx} cutoff/cutoffs must be positive.")
+    return cutoffs
 
 
 def parse_user_defined_basins(config: dict[str, Any], cv_headers: list[str]) -> dict[str, Any]:
@@ -776,31 +845,52 @@ def parse_user_defined_basins(config: dict[str, Any], cv_headers: list[str]) -> 
     ndim = len(cvs_to_label)
     basins = []
     for idx, basin in enumerate(basins_raw):
-        if not isinstance(basin, dict) or "center" not in basin:
-            raise ValueError(f"Basin #{idx} must define a center.")
-        center = np.asarray(basin["center"], dtype=np.float32)
-        if center.shape != (ndim,):
-            raise ValueError(f"Basin #{idx} center must have length {ndim}.")
-        item: dict[str, Any] = {"label": int(basin.get("label", idx)), "center": center}
+        if not isinstance(basin, dict):
+            raise ValueError(f"Basin #{idx} must be a mapping.")
+        centers = coerce_basin_centers(basin, idx, ndim)
+        label = int(basin.get("label", idx))
+        if label < 0:
+            raise ValueError(f"Basin #{idx} label must be non-negative.")
         if assignment_mode == "box":
-            item["size"] = coerce_basin_size(basin["size"], ndim)
+            size_value = basin.get("sizes", basin.get("size", None))
+            if size_value is None:
+                raise ValueError(f"Basin #{idx} must define size or sizes for box assignment.")
+            sizes = coerce_basin_sizes(size_value, ndim, centers.shape[0], idx)
+            for center_idx, (center, size) in enumerate(zip(centers, sizes)):
+                basins.append(
+                    {
+                        "label": label,
+                        "center": center,
+                        "size": size,
+                        "source_index": idx,
+                        "center_index": center_idx,
+                    }
+                )
         else:
-            cutoff = float(basin.get("cutoff", basin.get("size", 0.0)))
-            if cutoff <= 0:
-                raise ValueError(f"Basin #{idx} cutoff must be positive.")
-            item["cutoff"] = cutoff
-        basins.append(item)
+            cutoff_value = basin.get("cutoffs", basin.get("cutoff", basin.get("size", 0.0)))
+            cutoffs = coerce_basin_cutoffs(cutoff_value, centers.shape[0], idx)
+            for center_idx, (center, cutoff) in enumerate(zip(centers, cutoffs)):
+                basins.append(
+                    {
+                        "label": label,
+                        "center": center,
+                        "cutoff": float(cutoff),
+                        "source_index": idx,
+                        "center_index": center_idx,
+                    }
+                )
 
-    labels = sorted(item["label"] for item in basins)
-    expected = list(range(len(basins)))
+    labels = sorted({item["label"] for item in basins})
+    expected = list(range(len(labels)))
     if labels != expected:
         raise ValueError(f"Basin labels must be contiguous 0..k-1; got {labels}, expected {expected}.")
-    basins.sort(key=lambda item: item["label"])
+    basins.sort(key=lambda item: (item["label"], item["source_index"], item["center_index"]))
     return {
         "cvs_to_label": list(cvs_to_label),
         "cv_indices": [cv_headers.index(name) for name in cvs_to_label],
         "assignment_mode": assignment_mode,
         "basins": basins,
+        "n_states": len(labels),
     }
 
 
@@ -808,7 +898,8 @@ def user_defined_basin_labeling(cv_data: np.ndarray, basin_spec: dict[str, Any])
     X = cv_data[:, basin_spec["cv_indices"]].astype(np.float32)
     basins = basin_spec["basins"]
     centers = np.stack([item["center"] for item in basins], axis=0)
-    n_states = len(basins)
+    center_labels = np.asarray([item["label"] for item in basins], dtype=np.int64)
+    n_states = int(basin_spec["n_states"])
     meta_state = np.full(X.shape[0], -1, dtype=np.int64)
     dist_to_centroid = np.full(X.shape[0], np.inf, dtype=np.float32)
     thresholds = np.ones(n_states, dtype=np.float32)
@@ -819,21 +910,34 @@ def user_defined_basin_labeling(cv_data: np.ndarray, basin_spec: dict[str, Any])
         norm_dist = np.max(scaled, axis=2).astype(np.float32)
         closest = np.argmin(norm_dist, axis=1)
         dist_to_centroid[:] = norm_dist[np.arange(X.shape[0]), closest]
-        for basin in basins:
-            label = basin["label"]
-            inside = np.all(np.abs(X - basin["center"][None, :]) <= basin["size"][None, :], axis=1)
-            meta_state[inside & (meta_state == -1)] = label
-        return meta_state, dist_to_centroid, thresholds, {"centers": centers, "sizes": sizes}
+        valid_dist = np.where(norm_dist <= 1.0, norm_dist, np.inf)
+        chosen = np.argmin(valid_dist, axis=1)
+        chosen_dist = valid_dist[np.arange(X.shape[0]), chosen]
+        inside = np.isfinite(chosen_dist)
+        meta_state[inside] = center_labels[chosen[inside]]
+        return meta_state, dist_to_centroid, thresholds, {
+            "centers": centers,
+            "center_labels": center_labels,
+            "sizes": sizes,
+        }
 
     cutoffs = np.asarray([item["cutoff"] for item in basins], dtype=np.float32)
     euclid = np.linalg.norm(X[:, None, :] - centers[None, :, :], axis=2).astype(np.float32)
     closest = np.argmin(euclid, axis=1)
     closest_dist = euclid[np.arange(X.shape[0]), closest]
     dist_to_centroid[:] = closest_dist
-    thresholds[:] = cutoffs
-    inside = closest_dist <= cutoffs[closest]
-    meta_state[inside] = closest[inside].astype(np.int64)
-    return meta_state, dist_to_centroid, thresholds, {"centers": centers, "cutoffs": cutoffs}
+    for state in range(n_states):
+        thresholds[state] = float(np.max(cutoffs[center_labels == state]))
+    valid_dist = np.where(euclid <= cutoffs[None, :], euclid, np.inf)
+    chosen = np.argmin(valid_dist, axis=1)
+    chosen_dist = valid_dist[np.arange(X.shape[0]), chosen]
+    inside = np.isfinite(chosen_dist)
+    meta_state[inside] = center_labels[chosen[inside]]
+    return meta_state, dist_to_centroid, thresholds, {
+        "centers": centers,
+        "center_labels": center_labels,
+        "cutoffs": cutoffs,
+    }
 
 
 def report_metastate_sizes(meta_state: np.ndarray, n_states: int) -> None:
@@ -859,7 +963,7 @@ def label_metastates(
             raise ValueError("user_defined_basins requires CV data.")
         basin_spec = parse_user_defined_basins(config, cv_headers)
         meta_state, dist, thresholds, details = user_defined_basin_labeling(cv_data, basin_spec)
-        n_states = len(basin_spec["basins"])
+        n_states = int(basin_spec["n_states"])
         centroid_plot_info = None
         if bool(config.get("plot_kmeans_centroids", False)):
             if centroid_plot_prefix is None:
@@ -873,6 +977,7 @@ def label_metastates(
                 centroid_plot_cvs=config.get("centroid_plot_cvs", basin_spec["cvs_to_label"]),
                 out_prefix=centroid_plot_prefix,
                 title_prefix="User-defined metastates on CVs",
+                center_labels=details["center_labels"],
             )
             for path in centroid_plot_info["paths"]:
                 print(f"[PLOT] Saved centroid plot: {path}")
@@ -892,6 +997,8 @@ def label_metastates(
                         "center": item["center"].tolist(),
                         **({"size": item["size"].tolist()} if "size" in item else {}),
                         **({"cutoff": float(item["cutoff"])} if "cutoff" in item else {}),
+                        "source_index": int(item["source_index"]),
+                        "center_index": int(item["center_index"]),
                     }
                     for item in basin_spec["basins"]
                 ],
@@ -901,6 +1008,7 @@ def label_metastates(
                         "cvs": centroid_plot_info["cvs"],
                         "paths": centroid_plot_info["paths"],
                         "centers": centroid_plot_info["centers"].tolist(),
+                        "center_labels": centroid_plot_info["center_labels"].tolist(),
                     }
                     if centroid_plot_info is not None else None
                 ),
@@ -912,6 +1020,7 @@ def label_metastates(
                     "cvs": centroid_plot_info["cvs"],
                     "paths": centroid_plot_info["paths"],
                     "centers": centroid_plot_info["centers"].tolist(),
+                    "center_labels": centroid_plot_info["center_labels"].tolist(),
                 }
                 if centroid_plot_info is not None else None
             ),

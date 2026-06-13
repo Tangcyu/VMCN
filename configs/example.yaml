@@ -67,7 +67,16 @@ NEXT_HIT_COMMITTOR:
   loss:
     lambda_dir: 1.0
     lambda_bc: 10.0
+    lambda_bc_schedule:
+      enabled: false
+      mode: "exponential"
+      lambda_initial: 100.0
+      lambda_final: 10.0
+      start_epoch: 1
+      decay_epochs: 100
+    lambda_simplex: 0.0
     lambda_flux: 0.1
+    weighted_simplex: false
     n_thresholds: 9
     flux_eps: 0.02
 

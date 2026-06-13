@@ -15,7 +15,7 @@ When these assumptions fail, we need diagnostics to decide whether to split, mer
 ## Quality Decomposition
 
 ```
-label quality = committor consistency + local kinetic stability + feature-space clustering
+label quality = committor consistency + lagged uncertainty + feature-space inspection
 ```
 
 ### 1. Committor Consistency
@@ -32,13 +32,13 @@ High confidence means the model assigns a sharp committor value. Low confidence 
 
 Label consistency: for a frame with label y(x), consistency = q_{y(x)}(x). If the model is consistent with the label, this should be close to 1.
 
-### 2. Local Kinetic Stability
+### 2. Lagged Uncertainty
 
 Estimated from short unbiased trajectories using lagged pairs (t, t+tau) within the same trajectory.
 
-**Retention probability**: p_stay(C, tau) = P(x_{t+tau} in C | x_t in C). High retention indicates the region is kinetically stable at short timescales.
+**Lagged committor entropy**: H_norm(q(x_{t+tau})) asks whether an uncertain frame stays uncertain after a short lag.
 
-**Committor autocorrelation**: C_q^C(tau) measures how slowly the committor vector decorrelates inside region C. High autocorrelation at lag tau indicates slow dynamics within the region.
+If H_norm(x_t) is high but H_norm(x_{t+tau}) drops and q_max(x_{t+tau}) is high, the frame is transition-state-like: it quickly commits to an existing basin. If entropy stays high at the lagged endpoint, the region is more consistent with a missed metastate, missing descriptor, or unresolved model capacity.
 
 ### 3. Confidence-Based Relabel Hints
 
@@ -48,7 +48,10 @@ Instead, the diagnostic table flags states by:
 - fraction of frames with q_label(x) below q_label_cutoff
 - mean own-state committor q_i(x)
 - mean normalized entropy
+- lagged normalized entropy
 - dominant q-argmax destination among low-consistency frames
+- uncertainty class: mislabeled metastate, missed metastate, transition state,
+  or unresolved uncertain
 
 These signals answer a narrower and more reliable question: "Where do the current labels disagree with the learned committor?"
 
@@ -87,4 +90,5 @@ If high-entropy frames persist after obvious relabel/reassignment fixes and do n
 ## References
 
 - The committor-vector framework follows the next-hit formulation: q_i(x) is the probability that state S_i is reached before all other labeled states.
-- Kinetic stability estimation via lagged pairs is analogous to implied timescale analysis in Markov state models.
+- Lagged uncertainty estimation uses trajectory-safe lagged pairs; it is a triage
+  signal, not proof that a new metastable state exists.

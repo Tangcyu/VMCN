@@ -1,22 +1,15 @@
 from __future__ import annotations
 
-import argparse
 import csv
 import os
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from ..common.config import ensure_dir, load_yaml, select_section, setup_device, write_yaml
+from ..common.config import ensure_dir
 from ..common.data import (
-    apply_stride,
     cv_headers_for_pack,
-    infer_n_states,
-    load_dataset,
-    select_model_inputs,
 )
-from ..next_hit.predict import infer_probabilities, load_committor_model
 
 
 def _entropy_confidence(q_values: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -33,8 +26,15 @@ def _write_csv(path: str, rows: list[dict[str, Any]]) -> None:
     if not rows:
         with open(path, "w", newline="") as fh:
             return
+    fieldnames = list(rows[0].keys())
+    seen = set(fieldnames)
+    for row in rows[1:]:
+        for key in row.keys():
+            if key not in seen:
+                fieldnames.append(key)
+                seen.add(key)
     with open(path, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -242,125 +242,12 @@ def plot_relabel_cv(pack, old_state, new_state, proposal, config, output_dir):
     return saved
 
 
-def propose_relabeling(q_values, state_labels, config):
-    confidence_cfg = config.get("confidence", {})
-    relabel_cfg = config.get("relabel", {})
-
-    q_label_cutoff = float(confidence_cfg.get("q_label_cutoff", 0.7))
-    frac_low_cutoff = float(confidence_cfg.get("state_fraction_low_cutoff", 0.2))
-    mean_q_cutoff = float(confidence_cfg.get("state_mean_q_cutoff", 0.75))
-    entropy_cutoff = float(confidence_cfg.get("entropy_cutoff_ambiguous", 0.5))
-    dominance_cutoff = float(confidence_cfg.get("reassign_dominance_cutoff", 0.65))
-    reassign_q_cutoff = float(relabel_cfg.get("reassign_q_cutoff", q_label_cutoff))
-    missing_qmax_cutoff = float(relabel_cfg.get("missing_qmax_cutoff", q_label_cutoff))
-    mark_ambiguous = bool(relabel_cfg.get("mark_ambiguous_as_unlabeled", False))
-
-    state_labels = np.asarray(state_labels, dtype=np.int64)
-    proposed = state_labels.copy()
-    n_states = int(q_values.shape[1])
-    q_max, q_argmax, _, entropy_norm = _entropy_confidence(q_values)
-
-    label_consistency = np.full(state_labels.shape[0], np.nan, dtype=np.float64)
-    valid = (state_labels >= 0) & (state_labels < n_states)
-    idx = np.flatnonzero(valid)
-    label_consistency[valid] = q_values[idx, state_labels[valid]]
-
-    changed_mask = np.zeros(state_labels.shape[0], dtype=bool)
-    review_mixed_mask = np.zeros(state_labels.shape[0], dtype=bool)
-    review_missing_mask = (entropy_norm >= entropy_cutoff) & (q_max < missing_qmax_cutoff)
-    if mark_ambiguous:
-        proposed[review_missing_mask] = -1
-        changed_mask |= review_missing_mask & (state_labels != -1)
-
-    action_rows = []
-    state_rows = []
-
-    for state in range(n_states):
-        mask = state_labels == state
-        n_state = int(np.sum(mask))
-        if n_state == 0:
-            continue
-
-        own_q = q_values[mask, state]
-        low_mask = mask & np.isfinite(label_consistency) & (label_consistency < q_label_cutoff)
-        n_low = int(np.sum(low_mask))
-        frac_low = float(n_low / max(1, n_state))
-        mean_q_own = float(np.mean(own_q))
-        mean_entropy = float(np.mean(entropy_norm[mask]))
-
-        dominant_alt = -1
-        dominant_alt_fraction = 0.0
-        n_reassigned = 0
-        issue = "no_confidence_issue"
-        action = "keep"
-
-        if n_low:
-            alt = q_argmax[low_mask]
-            alt = alt[alt != state]
-            if alt.size:
-                counts = np.bincount(alt, minlength=n_states)
-                dominant_alt = int(np.argmax(counts))
-                dominant_alt_fraction = float(counts[dominant_alt] / n_low)
-
-        unreliable = frac_low >= frac_low_cutoff or mean_q_own < mean_q_cutoff
-        ambiguous = mean_entropy >= entropy_cutoff
-
-        if unreliable and dominant_alt >= 0 and dominant_alt_fraction >= dominance_cutoff:
-            reassign_mask = (
-                low_mask
-                & (q_argmax == dominant_alt)
-                & (q_values[:, dominant_alt] >= reassign_q_cutoff)
-            )
-            proposed[reassign_mask] = dominant_alt
-            changed_mask |= reassign_mask & (state_labels != dominant_alt)
-            n_reassigned = int(np.sum(reassign_mask))
-            issue = "possible_reassignment_or_merge"
-            action = "reassign_low_consistency_frames"
-        elif unreliable:
-            review_mixed_mask |= low_mask
-            issue = "ambiguous_or_missing_coordinate" if ambiguous else "possible_mislabel_or_broad_state"
-            action = "review_for_split_or_descriptor_issue"
-        elif ambiguous:
-            issue = "transition_like_or_low_confidence"
-            action = "review_entropy"
-
-        state_rows.append({
-            "state": state,
-            "n_frames": n_state,
-            "n_low_consistency": n_low,
-            "fraction_low_consistency": frac_low,
-            "mean_q_own": mean_q_own,
-            "mean_entropy_norm": mean_entropy,
-            "dominant_alternative_state": dominant_alt,
-            "dominant_alternative_fraction": dominant_alt_fraction,
-            "issue": issue,
-            "action": action,
-            "n_reassigned": n_reassigned,
-        })
-
-        if action != "keep":
-            action_rows.append(state_rows[-1])
-
-    return {
-        "proposed_labels": proposed,
-        "changed_mask": changed_mask,
-        "review_mixed_mask": review_mixed_mask,
-        "review_missing_mask": review_missing_mask,
-        "state_actions": state_rows,
-        "action_rows": action_rows,
-        "q_max": q_max,
-        "q_argmax": q_argmax,
-        "entropy_norm": entropy_norm,
-        "label_consistency": label_consistency,
-    }
-
-
 def _rows_for_frames(indices, old_labels, new_labels, proposal, traj_id, frame_index, max_rows=None):
     if max_rows is not None and len(indices) > int(max_rows):
         indices = indices[: int(max_rows)]
     rows = []
     for idx in indices:
-        rows.append({
+        row = {
             "frame_global_index": int(idx),
             "trajectory_index": int(traj_id[idx]),
             "frame_index": int(frame_index[idx]),
@@ -371,7 +258,14 @@ def _rows_for_frames(indices, old_labels, new_labels, proposal, traj_id, frame_i
             "label_consistency": float(proposal["label_consistency"][idx])
             if np.isfinite(proposal["label_consistency"][idx]) else np.nan,
             "q_entropy_norm": float(proposal["entropy_norm"][idx]),
-        })
+        }
+        if "mean_lagged_entropy_norm" in proposal:
+            value = proposal["mean_lagged_entropy_norm"][idx]
+            row["mean_lagged_entropy_norm"] = float(value) if np.isfinite(value) else np.nan
+        if "lagged_high_entropy_fraction" in proposal:
+            value = proposal["lagged_high_entropy_fraction"][idx]
+            row["lagged_high_entropy_fraction"] = float(value) if np.isfinite(value) else np.nan
+        rows.append(row)
     return rows
 
 
@@ -446,121 +340,3 @@ def _save_dataset_like_input(dataset_path, output_path, pack, new_state, config,
         return output_path
 
     raise ValueError("Relabeled dataset output must end in .pt, .pth, or .npz.")
-
-
-def run_apply_relabel(dataset_path, model_path, config, device="cuda:0", batch_size=65536, dataset_stride=1):
-    from .label_diagnostics import _compute_frame_index
-
-    device_obj = setup_device(device)
-    stride = int(dataset_stride)
-    pack = apply_stride(load_dataset(dataset_path), stride)
-    n_states = infer_n_states(pack, config.get("n_states", None))
-    model_features, _ = select_model_inputs(pack, config)
-
-    model = load_committor_model(model_path, device_obj)
-    q_values = infer_probabilities(model, model_features.float(), device_obj, batch_size=int(batch_size))
-    if q_values.ndim != 2 or q_values.shape[1] != n_states:
-        raise RuntimeError(f"Model returned q shape {q_values.shape}, expected (_, {n_states}).")
-
-    state = pack.state.detach().cpu().numpy().astype(np.int64)
-    traj_id = (
-        pack.traj_id.detach().cpu().numpy().astype(np.int64)
-        if pack.traj_id is not None
-        else np.zeros(state.shape[0], dtype=np.int64)
-    )
-    frame_index = _compute_frame_index(traj_id)
-
-    proposal = propose_relabeling(q_values, state, config)
-    new_state = proposal["proposed_labels"]
-    changed = np.flatnonzero(proposal["changed_mask"])
-    review_mixed = np.flatnonzero(proposal["review_mixed_mask"] & ~proposal["changed_mask"])
-    review_missing = np.flatnonzero(proposal["review_missing_mask"] & ~proposal["changed_mask"])
-
-    output_dir = ensure_dir(config.get("output_dir", "relabel_out"))
-    relabel_cfg = config.get("relabel", {})
-    default_output = os.path.join(output_dir, f"relabeled_dataset{Path(str(dataset_path)).suffix or '.pt'}")
-    output_dataset = relabel_cfg.get("output_dataset", default_output)
-
-    if bool(relabel_cfg.get("write_relabel_dataset", True)):
-        saved_dataset = _save_dataset_like_input(dataset_path, output_dataset, pack, new_state, config, stride)
-    else:
-        saved_dataset = None
-
-    max_review = relabel_cfg.get("max_review_frames", 20000)
-    _write_csv(os.path.join(output_dir, "relabel_actions.csv"), proposal["action_rows"])
-    _write_csv(
-        os.path.join(output_dir, "relabel_changed_frames.csv"),
-        _rows_for_frames(changed, state, new_state, proposal, traj_id, frame_index),
-    )
-    _write_csv(
-        os.path.join(output_dir, "relabel_review_mixed_frames.csv"),
-        _rows_for_frames(review_mixed, state, new_state, proposal, traj_id, frame_index, max_review),
-    )
-    _write_csv(
-        os.path.join(output_dir, "relabel_review_missing_signal_frames.csv"),
-        _rows_for_frames(review_missing, state, new_state, proposal, traj_id, frame_index, max_review),
-    )
-    saved_plots = []
-    if bool(config.get("make_plots", True)) and bool(relabel_cfg.get("make_relabel_plots", True)):
-        saved_plots = plot_relabel_cv(pack, state, new_state, proposal, config, output_dir)
-
-    summary = {
-        "dataset": os.path.abspath(str(dataset_path)),
-        "model": os.path.abspath(str(model_path)),
-        "output_dataset": None if saved_dataset is None else os.path.abspath(saved_dataset),
-        "dataset_stride": stride,
-        "n_frames": int(state.shape[0]),
-        "n_changed_frames": int(changed.size),
-        "n_review_mixed_frames": int(review_mixed.size),
-        "n_review_missing_signal_frames": int(review_missing.size),
-        "plots": [os.path.abspath(path) for path in saved_plots],
-        "state_actions": proposal["state_actions"],
-        "notes": [
-            "Automatic changes are limited to dominant q-argmax reassignment among low-consistency frames.",
-            "Mixed-destination and high-entropy/no-strong-destination frames are review signals only.",
-            "If dataset_stride > 1, the output dataset contains the strided analysis frames only.",
-        ],
-    }
-    write_yaml(summary, os.path.join(output_dir, "relabel_apply_summary.yaml"))
-    print(f"[RELABEL] Changed frames: {changed.size}")
-    print(f"[RELABEL] Review mixed frames: {review_mixed.size}")
-    print(f"[RELABEL] Review missing-signal frames: {review_missing.size}")
-    if saved_dataset is not None:
-        print(f"[RELABEL] Saved relabeled dataset: {saved_dataset}")
-    if saved_plots:
-        print("[RELABEL] Saved relabel plots:")
-        for path in saved_plots:
-            print(f"  {path}")
-    print(f"[RELABEL] Summary: {os.path.join(output_dir, 'relabel_apply_summary.yaml')}")
-    return summary
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Apply conservative confidence-based relabel proposals."
-    )
-    parser.add_argument("--config", required=True, help="YAML config path")
-    args = parser.parse_args()
-
-    raw = load_yaml(args.config)
-    cfg = select_section(raw, "RELABEL", "TENSORQ_RELABEL")
-    dataset_path = cfg.get("dataset", cfg.get("dataset_path"))
-    if dataset_path is None:
-        raise KeyError("Relabel config needs 'dataset' or 'dataset_path'.")
-    model_path = cfg.get("model")
-    if model_path is None:
-        raise KeyError("Relabel config needs 'model' (path to trained checkpoint).")
-
-    cfg["output_dir"] = ensure_dir(cfg.get("output_dir", cfg.get("out_dir", "relabel")))
-    run_apply_relabel(
-        dataset_path=dataset_path,
-        model_path=model_path,
-        config=cfg,
-        device=str(cfg.get("device", "cuda:0")),
-        batch_size=int(cfg.get("batch_size", 65536)),
-        dataset_stride=int(cfg.get("dataset_stride", 1)),
-    )
-
-
-if __name__ == "__main__":
-    main()

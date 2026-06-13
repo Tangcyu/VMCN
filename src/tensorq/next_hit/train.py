@@ -23,7 +23,7 @@ from ..common.data import (
     split_train_val,
 )
 from ..common.flux import make_thresholds, resolve_ordered_pairs
-from .losses import total_committor_loss
+from .losses import boundary_weight_schedule, total_committor_loss
 from .metrics import endpoint_boundary_accuracy, mean_entropy, normalization_error
 from .model import NextHitCommittorNet
 
@@ -173,6 +173,7 @@ def run_epoch(
     pairs: list[tuple[int, int]],
     thresholds: torch.Tensor,
     loss_cfg: dict[str, Any],
+    lambda_bc: float,
     use_amp: bool,
 ) -> dict[str, Any]:
     model.train(train)
@@ -181,6 +182,7 @@ def run_epoch(
         "total_loss": torch.zeros((), dtype=torch.float64, device=device),
         "dirichlet_loss": torch.zeros((), dtype=torch.float64, device=device),
         "boundary_loss": torch.zeros((), dtype=torch.float64, device=device),
+        "simplex_loss": torch.zeros((), dtype=torch.float64, device=device),
         "flux_loss": torch.zeros((), dtype=torch.float64, device=device),
         "boundary_accuracy": torch.zeros((), dtype=torch.float64, device=device),
         "mean_entropy": torch.zeros((), dtype=torch.float64, device=device),
@@ -209,11 +211,13 @@ def run_epoch(
                     flux_eps=float(loss_cfg.get("flux_eps", 0.02)),
                     sample_weights=batch["weight"],
                     lambda_dir=float(loss_cfg.get("lambda_dir", 1.0)),
-                    lambda_bc=float(loss_cfg.get("lambda_bc", 10.0)),
+                    lambda_bc=float(lambda_bc),
+                    lambda_simplex=float(loss_cfg.get("lambda_simplex", 0.0)),
                     lambda_flux=float(loss_cfg.get("lambda_flux", 0.1)),
                     boundary_mode=str(loss_cfg.get("boundary_mode", "cross_entropy")),
                     weighted_dirichlet=bool(loss_cfg.get("weighted_dirichlet", True)),
                     weighted_boundary=bool(loss_cfg.get("weighted_boundary", False)),
+                    weighted_simplex=bool(loss_cfg.get("weighted_simplex", False)),
                     weighted_flux=bool(loss_cfg.get("weighted_flux", True)),
                     tau=float(loss_cfg.get("tau", loss_cfg.get("lag", 1.0))),
                     scale_dirichlet_by_tau=bool(loss_cfg.get("scale_dirichlet_by_tau", False)),
@@ -237,6 +241,7 @@ def run_epoch(
             totals["total_loss"] += losses["total_loss"].detach().double() * bs
             totals["dirichlet_loss"] += losses["dirichlet_loss"].detach().double() * bs
             totals["boundary_loss"] += losses["boundary_loss"].detach().double() * bs
+            totals["simplex_loss"] += losses["simplex_loss"].detach().double() * bs
             totals["flux_loss"] += losses["flux_loss"].detach().double() * bs
             totals["boundary_accuracy"] += endpoint_boundary_accuracy(
                 q_t.detach(), q_tau.detach(), batch["state_t"], batch["state_tau"]
@@ -258,6 +263,7 @@ def run_epoch(
     stats["J"] = J_mean
     stats["flux_variance_by_pair"] = V_mean
     stats["n_samples"] = int(n_seen)
+    stats["lambda_bc"] = float(lambda_bc)
     return stats
 
 
@@ -273,12 +279,13 @@ def append_history(path: str, epoch: int, train_stats: dict[str, Any], val_stats
         "total_loss",
         "dirichlet_loss",
         "boundary_loss",
+        "simplex_loss",
         "flux_loss",
         "boundary_accuracy",
         "mean_entropy",
         "normalization_error",
     ]
-    row = {"epoch": epoch}
+    row = {"epoch": epoch, "lambda_bc": train_stats.get("lambda_bc", val_stats.get("lambda_bc"))}
     for prefix, stats in (("train", train_stats), ("val", val_stats)):
         for key in scalar_keys:
             row[f"{prefix}_{key}"] = stats[key]
@@ -451,6 +458,11 @@ def train_next_hit_committor(config: dict[str, Any]) -> dict[str, Any]:
 
     loss_cfg = dict(config.get("loss", {}))
     loss_cfg.setdefault("lag", lag)
+    lambda_bc_schedule_cfg = loss_cfg.get("lambda_bc_schedule", {})
+    if lambda_bc_schedule_cfg is None:
+        lambda_bc_schedule_cfg = {}
+    if not isinstance(lambda_bc_schedule_cfg, dict):
+        raise ValueError("loss.lambda_bc_schedule must be a mapping when provided.")
     thresholds = make_thresholds(
         loss_cfg.get("thresholds", None),
         n_thresholds=int(loss_cfg.get("n_thresholds", 9)),
@@ -496,8 +508,31 @@ def train_next_hit_committor(config: dict[str, Any]) -> dict[str, Any]:
         f"output_normalization = {model.output_normalization}"
     )
     print(f"[FLUX] ordered pairs = {pairs}")
+    schedule_enabled = bool(lambda_bc_schedule_cfg.get("enabled", False))
+    schedule_mode = str(lambda_bc_schedule_cfg.get("mode", "fixed"))
+    if schedule_enabled and schedule_mode.lower() not in {"fixed", "constant", "none"}:
+        print(
+            "[LOSS] lambda_bc schedule: "
+            f"mode={schedule_mode}, "
+            f"initial={lambda_bc_schedule_cfg.get('lambda_initial', loss_cfg.get('lambda_bc', 10.0))}, "
+            f"final={lambda_bc_schedule_cfg.get('lambda_final', loss_cfg.get('lambda_bc', 10.0))}, "
+            f"start_epoch={lambda_bc_schedule_cfg.get('start_epoch', 1)}, "
+            f"decay_epochs={lambda_bc_schedule_cfg.get('decay_epochs', 100)}"
+        )
+    else:
+        print(f"[LOSS] lambda_bc fixed at {float(loss_cfg.get('lambda_bc', 10.0)):.6g}")
 
     for epoch in range(1, epochs + 1):
+        lambda_bc = boundary_weight_schedule(
+            epoch,
+            lambda_bc=float(loss_cfg.get("lambda_bc", 10.0)),
+            enabled=schedule_enabled,
+            mode=schedule_mode,
+            lambda_initial=lambda_bc_schedule_cfg.get("lambda_initial", None),
+            lambda_final=lambda_bc_schedule_cfg.get("lambda_final", None),
+            start_epoch=int(lambda_bc_schedule_cfg.get("start_epoch", 1)),
+            decay_epochs=float(lambda_bc_schedule_cfg.get("decay_epochs", 100.0)),
+        )
         train_stats = run_epoch(
             model,
             train_loader,
@@ -508,6 +543,7 @@ def train_next_hit_committor(config: dict[str, Any]) -> dict[str, Any]:
             pairs=pairs,
             thresholds=thresholds,
             loss_cfg=loss_cfg,
+            lambda_bc=lambda_bc,
             use_amp=use_amp,
         )
         val_stats = run_epoch(
@@ -520,6 +556,7 @@ def train_next_hit_committor(config: dict[str, Any]) -> dict[str, Any]:
             pairs=pairs,
             thresholds=thresholds,
             loss_cfg=loss_cfg,
+            lambda_bc=lambda_bc,
             use_amp=use_amp,
         )
         append_history(history_path, epoch, train_stats, val_stats)
@@ -550,12 +587,15 @@ def train_next_hit_committor(config: dict[str, Any]) -> dict[str, Any]:
 
         print(
             f"[Epoch {epoch:4d}] "
+            f"lambda_bc={lambda_bc:.6g} "
             f"train={train_stats['total_loss']:.6e} "
             f"(dir={train_stats['dirichlet_loss']:.3e}, bc={train_stats['boundary_loss']:.3e}, "
+            f"simplex={train_stats['simplex_loss']:.3e}, "
             f"flux={train_stats['flux_loss']:.3e}, acc={train_stats['boundary_accuracy']:.3f}, "
             f"H={train_stats['mean_entropy']:.3f})  "
             f"val={val_stats['total_loss']:.6e} "
             f"(dir={val_stats['dirichlet_loss']:.3e}, bc={val_stats['boundary_loss']:.3e}, "
+            f"simplex={val_stats['simplex_loss']:.3e}, "
             f"flux={val_stats['flux_loss']:.3e}, acc={val_stats['boundary_accuracy']:.3f}, "
             f"H={val_stats['mean_entropy']:.3f})  "
             f"best={state.best_val:.6e}@{state.best_epoch}"

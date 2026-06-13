@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Sequence
 
 import torch
@@ -13,6 +14,42 @@ def weighted_mean(values: torch.Tensor, weights: torch.Tensor | None = None) -> 
         return values.mean()
     w = weights.to(device=values.device, dtype=values.dtype).reshape(values.shape[0], *([1] * (values.ndim - 1)))
     return (values * w).sum() / (w.sum() + 1e-12)
+
+
+def boundary_weight_schedule(
+    epoch: int,
+    *,
+    lambda_bc: float = 10.0,
+    enabled: bool = False,
+    mode: str = "fixed",
+    lambda_initial: float | None = None,
+    lambda_final: float | None = None,
+    start_epoch: int = 1,
+    decay_epochs: float = 100.0,
+) -> float:
+    """Resolve the boundary-restraint weight for one training epoch."""
+    if not enabled or str(mode).lower() in {"fixed", "constant", "none"}:
+        return float(lambda_bc)
+
+    initial = float(lambda_bc if lambda_initial is None else lambda_initial)
+    final = float(lambda_bc if lambda_final is None else lambda_final)
+    if int(start_epoch) < 1:
+        raise ValueError("lambda_bc_schedule.start_epoch must be >= 1 when annealing is enabled.")
+    if float(decay_epochs) <= 0:
+        raise ValueError("lambda_bc_schedule.decay_epochs must be positive when annealing is enabled.")
+
+    elapsed = max(0.0, float(epoch) - float(start_epoch))
+    mode = str(mode).lower()
+    if mode in {"exponential", "exp"}:
+        decay_factor = math.exp(-elapsed / float(decay_epochs))
+    elif mode == "linear":
+        decay_factor = max(0.0, 1.0 - elapsed / float(decay_epochs))
+    elif mode == "cosine":
+        progress = min(1.0, elapsed / float(decay_epochs))
+        decay_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+    else:
+        raise ValueError("lambda_bc_schedule.mode must be 'fixed', 'exponential', 'linear', or 'cosine'.")
+    return final + (initial - final) * decay_factor
 
 
 def dirichlet_loss(
@@ -72,6 +109,13 @@ def endpoint_boundary_loss(
     return boundary_loss(q, labels, weights=w, mode=mode)
 
 
+def simplex_loss(q_t: torch.Tensor, q_tau: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
+    q = torch.cat([q_t, q_tau], dim=0)
+    w = torch.cat([weights, weights], dim=0) if weights is not None else None
+    per_sample = (q.sum(dim=1) - 1.0).square() + F.relu(-q).square().sum(dim=1)
+    return weighted_mean(per_sample, w)
+
+
 def total_committor_loss(
     q_t: torch.Tensor,
     q_tau: torch.Tensor,
@@ -83,10 +127,12 @@ def total_committor_loss(
     sample_weights: torch.Tensor | None,
     lambda_dir: float = 1.0,
     lambda_bc: float = 10.0,
+    lambda_simplex: float = 0.0,
     lambda_flux: float = 0.1,
     boundary_mode: str = "cross_entropy",
     weighted_dirichlet: bool = True,
     weighted_boundary: bool = False,
+    weighted_simplex: bool = False,
     weighted_flux: bool = True,
     tau: float | None = None,
     scale_dirichlet_by_tau: bool = False,
@@ -95,10 +141,15 @@ def total_committor_loss(
 ) -> dict[str, torch.Tensor]:
     w_dir = sample_weights if weighted_dirichlet else None
     w_bc = sample_weights if weighted_boundary else None
+    w_simplex = sample_weights if weighted_simplex else None
     w_flux = sample_weights if weighted_flux else None
 
     loss_dir = dirichlet_loss(q_t, q_tau, weights=w_dir, tau=tau, scale_by_tau=scale_dirichlet_by_tau)
     loss_bc = endpoint_boundary_loss(q_t, q_tau, state_t, state_tau, weights=w_bc, mode=boundary_mode)
+    if float(lambda_simplex) == 0.0:
+        loss_simplex = q_t.sum() * 0.0
+    else:
+        loss_simplex = simplex_loss(q_t, q_tau, weights=w_simplex)
     if float(lambda_flux) == 0.0:
         loss_flux = q_t.sum() * 0.0
         J = torch.zeros((len(pairs), thresholds.numel()), dtype=q_t.dtype, device=q_t.device)
@@ -116,11 +167,17 @@ def total_committor_loss(
             surface=flux_surface,
         )
 
-    total = float(lambda_dir) * loss_dir + float(lambda_bc) * loss_bc + float(lambda_flux) * loss_flux
+    total = (
+        float(lambda_dir) * loss_dir
+        + float(lambda_bc) * loss_bc
+        + float(lambda_simplex) * loss_simplex
+        + float(lambda_flux) * loss_flux
+    )
     return {
         "total_loss": total,
         "dirichlet_loss": loss_dir,
         "boundary_loss": loss_bc,
+        "simplex_loss": loss_simplex,
         "flux_loss": loss_flux,
         "J": J,
         "flux_variance": flux_var,

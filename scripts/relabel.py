@@ -5,7 +5,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from tensorq.relabel.apply import main
+from tensorq.relabel.relabel import main
 
 if __name__ == "__main__":
     main()
