@@ -106,9 +106,9 @@ refined paths, pathway network, exchange statistics
 ```
 NextHitCommittorNet checkpoint + dataset
     ↓ relabel/main.py (diagnose)
-diagnostic_summary.json, relabel_hints.csv
+diagnostic_summary.yaml
     ↓ relabel/relabel.py
-relabeled_dataset.pt
+relabel_summary.yaml, optional relabeled_dataset.pt
     ↓ retrain model with improved labels
 ```
 

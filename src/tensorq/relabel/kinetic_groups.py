@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 from .settings import analysis_settings
@@ -7,6 +9,10 @@ from .settings import analysis_settings
 
 def _cfg(config):
     return config.get("basin_kinetic_groups", {})
+
+
+def _seconds_since(start):
+    return round(float(time.perf_counter() - start), 6)
 
 
 def _as_lag_list(lag_pairs, config):
@@ -85,7 +91,7 @@ def _choose_microstate_count(n_core, kg_cfg):
     return int(max(2, n_micro))
 
 
-def _fit_microstates(features, core_idx, n_micro, kg_cfg, random_seed):
+def _fit_microstates(z, core_idx, n_micro, kg_cfg, random_seed):
     from sklearn.cluster import MiniBatchKMeans
 
     max_fit = int(kg_cfg.get("max_core_frames", kg_cfg.get("max_fit_frames", 200000)))
@@ -96,7 +102,6 @@ def _fit_microstates(features, core_idx, n_micro, kg_cfg, random_seed):
         fit_idx = np.sort(rng.choice(core_idx, size=max_fit, replace=False))
         sampled = True
 
-    z = _standardize_features(features)
     model = MiniBatchKMeans(
         n_clusters=int(n_micro),
         random_state=int(random_seed),
@@ -109,8 +114,62 @@ def _fit_microstates(features, core_idx, n_micro, kg_cfg, random_seed):
     return micro_labels, sampled
 
 
-def _transition_matrix(micro_by_frame, lag_pairs, lag, n_micro, weights=None):
+def _sample_pair_positions(pair_positions, max_pairs, random_seed):
+    pair_positions = np.asarray(pair_positions, dtype=np.int64)
+    max_pairs = int(max_pairs)
+    if max_pairs <= 0 or pair_positions.size <= max_pairs:
+        return pair_positions
+    rng = np.random.default_rng(int(random_seed))
+    return np.sort(rng.choice(pair_positions, size=max_pairs, replace=False)).astype(np.int64, copy=False)
+
+
+def _build_state_pair_positions(state_labels, lag_pairs, lag_list, n_states):
+    state_labels = np.asarray(state_labels, dtype=np.int64)
+    out = {}
+    for lag in lag_list:
+        idx_t, idx_tau = lag_pairs[int(lag)]
+        start_state = state_labels[idx_t]
+        end_state = state_labels[idx_tau]
+        same_state = (
+            (start_state == end_state)
+            & (start_state >= 0)
+            & (start_state < int(n_states))
+        )
+        positions = np.flatnonzero(same_state)
+        if positions.size == 0:
+            out[int(lag)] = {}
+            continue
+
+        states = start_state[positions]
+        order = np.argsort(states, kind="stable")
+        positions = positions[order]
+        states = states[order]
+        split_points = np.flatnonzero(np.diff(states)) + 1
+        state_chunks = np.split(positions, split_points)
+        state_values = np.split(states, split_points)
+        out[int(lag)] = {
+            int(values[0]): chunk.astype(np.int64, copy=False)
+            for values, chunk in zip(state_values, state_chunks)
+            if values.size
+        }
+    return out
+
+
+def _transition_matrix(
+    micro_by_frame,
+    lag_pairs,
+    lag,
+    n_micro,
+    weights=None,
+    pair_positions=None,
+    max_pairs=0,
+    random_seed=0,
+):
     idx_t, idx_tau = lag_pairs[int(lag)]
+    if pair_positions is not None:
+        pair_positions = _sample_pair_positions(pair_positions, max_pairs, random_seed)
+        idx_t = idx_t[pair_positions]
+        idx_tau = idx_tau[pair_positions]
     start_micro = micro_by_frame[idx_t]
     end_micro = micro_by_frame[idx_tau]
     valid = (start_micro >= 0) & (end_micro >= 0)
@@ -165,7 +224,7 @@ def _suggest_group_count(eigenvalues, n_micro, kg_cfg):
     return int(best_k), float(best_gap), confidence
 
 
-def _macro_assignments(eigenvectors, n_groups, random_seed):
+def _macro_assignments(eigenvectors, n_groups, random_seed, kg_cfg=None):
     if n_groups <= 1:
         return np.zeros(eigenvectors.shape[0], dtype=np.int64)
 
@@ -175,20 +234,22 @@ def _macro_assignments(eigenvectors, n_groups, random_seed):
     norms = np.linalg.norm(emb, axis=1)
     valid = norms > 1e-12
     emb[valid] = emb[valid] / norms[valid, None]
-    km = KMeans(n_clusters=int(n_groups), random_state=int(random_seed), n_init=20)
+    n_init = int((kg_cfg or {}).get("macrostate_n_init", 10))
+    km = KMeans(n_clusters=int(n_groups), random_state=int(random_seed), n_init=n_init)
     return km.fit_predict(emb).astype(np.int64, copy=False)
 
 
-def _feature_macro_assignments(features, core_idx, n_groups, random_seed):
+def _feature_macro_assignments(z, core_idx, n_groups, random_seed, kg_cfg=None):
     if n_groups <= 1:
         return np.zeros(core_idx.size, dtype=np.int64)
 
     from sklearn.cluster import KMeans
 
-    z = _standardize_features(features)
-    if np.unique(z[core_idx], axis=0).shape[0] < n_groups:
+    check = z[core_idx[: min(core_idx.size, 10000)]]
+    if np.unique(check, axis=0).shape[0] < n_groups:
         return np.zeros(core_idx.size, dtype=np.int64)
-    km = KMeans(n_clusters=int(n_groups), random_state=int(random_seed), n_init=20)
+    n_init = int((kg_cfg or {}).get("macrostate_n_init", 10))
+    km = KMeans(n_clusters=int(n_groups), random_state=int(random_seed), n_init=n_init)
     return km.fit_predict(z[core_idx]).astype(np.int64, copy=False)
 
 
@@ -220,11 +281,28 @@ def _renumber_frame_labels_by_population(labels):
     return out
 
 
-def _macro_transition_rows(macro_by_frame, lag_pairs, lag_list, n_groups, weights=None):
+def _macro_transition_rows(
+    macro_by_frame,
+    lag_pairs,
+    lag_list,
+    n_groups,
+    weights=None,
+    pair_positions_by_lag=None,
+    max_pairs=0,
+    random_seed=0,
+):
     matrices = {}
     raw_counts = {}
     for lag in lag_list:
         idx_t, idx_tau = lag_pairs[int(lag)]
+        if pair_positions_by_lag is not None:
+            pair_positions = _sample_pair_positions(
+                pair_positions_by_lag.get(int(lag), np.zeros(0, dtype=np.int64)),
+                max_pairs,
+                int(random_seed) + int(lag),
+            )
+            idx_t = idx_t[pair_positions]
+            idx_tau = idx_tau[pair_positions]
         start = macro_by_frame[idx_t]
         end = macro_by_frame[idx_tau]
         valid = (start >= 0) & (end >= 0)
@@ -291,15 +369,25 @@ def analyze_basin_kinetic_groups(state_labels, q_values, lag_pairs, config, weig
     group_rows = []
     state_rows = []
     next_group = 0
+    z = _standardize_features(features)
+    max_transition_pairs = int(kg_cfg.get("max_transition_pairs_per_state_lag", 0))
+    state_pair_positions = (
+        _build_state_pair_positions(state_labels, lag_pairs, lag_list, n_states)
+        if bool(kg_cfg.get("cache_state_pair_positions", True)) and lag_list
+        else {}
+    )
 
     for state in range(n_states):
+        state_start = time.perf_counter()
         state_mask = state_labels == state
         n_state = int(np.sum(state_mask))
         if n_state == 0:
             continue
 
+        core_start = time.perf_counter()
         core_mask = high_confidence_basin_core(q_values, state_labels, state, config, q_argmax=q_argmax)
         core_idx = np.flatnonzero(core_mask)
+        core_seconds = _seconds_since(core_start)
         n_core = int(core_idx.size)
         state_weight = float(np.sum(weights_arr[state_mask])) if weights_arr is not None else float(n_state)
         core_weight = float(np.sum(weights_arr[core_idx])) if weights_arr is not None else float(n_core)
@@ -323,61 +411,92 @@ def analyze_basin_kinetic_groups(state_labels, q_values, lag_pairs, config, weig
             "eigenvalues": "",
             "n_transition_pairs": 0,
             "microstate_fit_sampled": False,
+            "timing_core_selection_seconds": core_seconds,
+            "timing_microstate_fit_seconds": 0.0,
+            "timing_micro_transition_seconds": 0.0,
+            "timing_eigensystem_seconds": 0.0,
+            "timing_macro_assignment_seconds": 0.0,
+            "timing_macro_transition_seconds": 0.0,
+            "timing_state_total_seconds": 0.0,
             "mean_q_own_core": float(np.mean(q_values[core_idx, state])) if n_core else np.nan,
             "mean_q_max_core": float(np.mean(q_max[core_idx])) if n_core else np.nan,
             "mean_entropy_norm_core": float(np.mean(entropy_norm[core_idx])) if n_core else np.nan,
         }
         if n_micro < 2 or not lag_list:
+            base_row["timing_state_total_seconds"] = _seconds_since(state_start)
             state_rows.append(base_row)
             continue
 
+        step_start = time.perf_counter()
         micro_labels_core, sampled = _fit_microstates(
-            features,
+            z,
             core_idx,
             n_micro,
             kg_cfg,
             random_seed=random_seed + int(state),
         )
+        base_row["timing_microstate_fit_seconds"] = _seconds_since(step_start)
         micro_by_frame = np.full(n_frames, -1, dtype=np.int64)
         micro_by_frame[core_idx] = micro_labels_core
         micro_counts = np.bincount(micro_labels_core, minlength=n_micro).astype(np.int64, copy=False)
 
+        step_start = time.perf_counter()
         transition, _, _, n_transition_pairs = _transition_matrix(
             micro_by_frame,
             lag_pairs,
             analysis_lag,
             n_micro,
             weights=weights_arr,
+            pair_positions=state_pair_positions.get(int(analysis_lag), {}).get(
+                int(state), np.zeros(0, dtype=np.int64)
+            ) if state_pair_positions else None,
+            max_pairs=max_transition_pairs,
+            random_seed=random_seed + int(state) * 1009 + int(analysis_lag),
         )
+        base_row["timing_micro_transition_seconds"] = _seconds_since(step_start)
         if n_transition_pairs < min_pairs:
             base_row["n_transition_pairs"] = int(n_transition_pairs)
             base_row["microstate_fit_sampled"] = bool(sampled)
+            base_row["timing_state_total_seconds"] = _seconds_since(state_start)
             state_rows.append(base_row)
             continue
 
+        step_start = time.perf_counter()
         eigenvalues, eigenvectors = _sorted_eigensystem(transition)
         n_groups, eigengap_score, split_confidence = _suggest_group_count(eigenvalues, n_micro, kg_cfg)
-        macro_by_micro = _macro_assignments(eigenvectors, n_groups, random_seed + int(state))
+        base_row["timing_eigensystem_seconds"] = _seconds_since(step_start)
+        step_start = time.perf_counter()
+        macro_by_micro = _macro_assignments(eigenvectors, n_groups, random_seed + int(state), kg_cfg)
         macro_by_micro = _renumber_by_population(macro_by_micro, micro_counts)
         macro_labels_core = macro_by_micro[micro_labels_core]
         if n_groups > 1 and np.unique(macro_labels_core).size < n_groups:
             macro_labels_core = _feature_macro_assignments(
-                features,
+                z,
                 core_idx,
                 n_groups,
                 random_seed=random_seed + int(state),
+                kg_cfg=kg_cfg,
             )
             macro_labels_core = _renumber_frame_labels_by_population(macro_labels_core)
+        base_row["timing_macro_assignment_seconds"] = _seconds_since(step_start)
 
         macro_by_frame = np.full(n_frames, -1, dtype=np.int64)
         macro_by_frame[core_idx] = macro_labels_core
+        step_start = time.perf_counter()
         macro_matrices, macro_counts = _macro_transition_rows(
             macro_by_frame,
             lag_pairs,
             lag_list,
             n_groups,
             weights=weights_arr,
+            pair_positions_by_lag={
+                int(lag): state_pair_positions.get(int(lag), {}).get(int(state), np.zeros(0, dtype=np.int64))
+                for lag in lag_list
+            },
+            max_pairs=max_transition_pairs,
+            random_seed=random_seed + int(state) * 1009,
         )
+        base_row["timing_macro_transition_seconds"] = _seconds_since(step_start)
 
         base_row.update({
             "suggested_groups": int(n_groups),
@@ -387,6 +506,7 @@ def analyze_basin_kinetic_groups(state_labels, q_values, lag_pairs, config, weig
             "eigenvalues": _format_eigenvalues(eigenvalues),
             "n_transition_pairs": int(n_transition_pairs),
             "microstate_fit_sampled": bool(sampled),
+            "timing_state_total_seconds": _seconds_since(state_start),
         })
         state_rows.append(base_row)
 

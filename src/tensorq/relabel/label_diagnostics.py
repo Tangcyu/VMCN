@@ -935,11 +935,4 @@ def run_relabel(
 
     results = diagnostics.run_all()
 
-    output_cfg = config.get("output", {})
-    if bool(output_cfg.get("save_q_values", True)):
-        q_path = os.path.join(output_dir, "Q.npy")
-        np.save(q_path, q_values.astype(np.float32))
-        results["Q_npy"] = os.path.abspath(q_path)
-    results["q_values"] = q_values
-
     return results

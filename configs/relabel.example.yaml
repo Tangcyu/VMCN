@@ -1,109 +1,171 @@
 # ============================================================
-# TensorQ Relabel — State-Label Confidence Diagnostics
+# TensorQ Relabel
 # ============================================================
 #
 # Usage:
 #   python scripts/relabel_diagnose.py --config configs/relabel.example.yaml
-#   python scripts/relabel.py  --config configs/relabel.example.yaml
+#   python scripts/relabel.py          --config configs/relabel.example.yaml
 #
-# This runs post-training diagnostics on a trained committor-vector
-# model to evaluate whether current state labels are reliable.
-# It detects split candidates, merge candidates, and missing-state
-# candidates, and generates diagnostic plots in CV space.
+# Current outputs:
+#   diagnose -> diagnostic_summary.yaml
+#   relabel  -> relabel_summary.yaml
+#   relabel  -> optional relabeled dataset
+#   relabel  -> optional diagnostic plots
+#
+# Automatic relabeling follows:
+#   entropy -> density -> kinetics
 
 RELABEL:
   # ---- Required inputs ----
-  # Dataset produced by TENSORQ_LABEL (dataset.pt or dataset.npz).
+  # Dataset produced by TENSORQ_LABEL / next_hit label.
   dataset: "./dataset_out/dataset.pt"
-  dataset_path: "./dataset_out/dataset.pt"   # alias
 
-  # Trained model checkpoint (TorchScript or next_hit best_checkpoint.pt).
+  # Trained next-hit committor-vector checkpoint.
   model: "./next_hit_train/next_hit_committor_best_checkpoint.pt"
 
   # ---- Output ----
   output_dir: "./relabel"
-  out_dir: "./relabel"                       # alias
 
   # ---- Device and inference ----
   device: "cuda:0"
   batch_size: 65536
   dataset_stride: 1
-
-  # Optional explicit state count (null infers from dataset metadata).
   n_states: null
 
-  # Model input-space options when model is a checkpoint.
-  model_input_space: "features"              # "features" or "cv"
+  # ---- Model input selection ----
+  # "features" uses dataset features directly; "cv" rebuilds model inputs from
+  # selected CV columns.
+  model_input_space: "features"
   cvs_to_use: []
   periodic_cvs: false
   periodic_cv_units: "degrees"
 
   # ---- Shared diagnose/relabel decisions ----
-  # These are the main knobs. Older confidence/kinetics/uncertainty keys still
-  # work as compatibility fallbacks, but new configs should start here.
   analysis:
     lag_list: [1, 2, 5, 10, 20]
-    q_cutoff: 0.7              # committed if q_max >= q_cutoff.
-    entropy_cutoff: 0.5        # uncertain if H_norm >= entropy_cutoff.
-    lagged_entropy_cutoff: 0.5 # high H_tau if H_norm(x_{t+tau}) >= this.
-    lagged_qmax_cutoff: 0.7    # retained for diagnostics/backward-compatible summaries.
-    core_cutoff: 0.8           # high-confidence core for splitting existing labels.
-    min_count: 50              # minimum lagged-pair/group support.
-    persistent_fraction: 0.5   # persistent uncertain frames are missing-state review candidates.
-    eigengap: 0.05             # local spectral-MSM split threshold.
+    q_cutoff: 0.7
+    entropy_cutoff: 0.5
+    lagged_entropy_cutoff: 0.5
+    lagged_qmax_cutoff: 0.7
+    core_cutoff: 0.8
+    min_count: 50
+    persistent_fraction: 0.5
+    eigengap: 0.05
     max_groups: 6
     min_group_size: 50
     min_slow_eigenvalue: 0.8
     random_seed: 0
 
   # ---- Diagnostics ----
+  # Diagnostics writes only diagnostic_summary.yaml.
   diagnostics:
     compute_lagged_entropy: true
+    compute_basin_kinetic_groups: true
     profile_timing: true
 
-  output:
-    save_per_frame_csv: false
-    save_per_frame_npz: false
-    save_q_values: true
-
+  # ---- Relabeling ----
+  # Relabeling writes relabel_summary.yaml and, if enabled below, a relabeled
+  # dataset. It does not write per-frame CSV dumps.
   relabel:
-    # Dataset writing and bookkeeping.
     write_relabel_dataset: true
     output_dataset: "./relabel/relabeled_dataset.pt"
     compact_labels: true
-    max_review_frames: 20000
+    make_plots: true
 
-    # Existing-label cleanup before adding new labels. Slow-mode split groups
-    # smaller than min_new_core_size are dropped to -1 instead of new labels.
+    # Entropy stage, state-level pruning.
+    # A whole state is removed when most frames are low-consistency or
+    # high-entropy, or when too little stable high-confidence core remains.
+    remove_inconsistent_states: true
     remove_problem_fraction_cutoff: 0.9
-    reshape_existing_basins: true
+    remove_min_stable_fraction: 0.5
 
-    # H(x) candidate selection uses analysis.entropy_cutoff; H_tau candidate
-    # classification uses analysis.lagged_entropy_cutoff.
+    # Entropy stage, frame-level candidates.
+    candidate_require_current_low_qmax: false
+    candidate_current_qmax_cutoff: 0.7
     candidate_lag_list: [1, 2, 5, 10, 20]
+    candidate_lagged_entropy_min_valid_lags: 1
+    candidate_no_valid_lag_policy: "review"
 
-    # Missing-metastate clustering. graph_space:auto follows model_input_space
-    # when available; otherwise it uses CVs.
-    graph_space: auto
-    random_seed: 0
+    # Density stage. Persistent high-lagged-entropy candidates are grouped in
+    # graph_space and trimmed to weighted local-density cores.
+    promote_missing_metastate_candidates: true
+    graph_space: "auto"
     max_graph_frames: 20000
     k_neighbors: 20
+    candidate_graph_mode: "mutual_knn"
+    candidate_cluster_core_fraction: 0.5
     min_new_core_size: 100
+    min_new_core_weight: 0.0
+    density_core_enabled: true
     density_core_fraction: 0.5
+    density_core_min_weight: 0.0
+    density_core_max_size: null
 
-    # Merge newly created labels if they exchange strongly at lag time.
+    # Kinetics stage, new-label merge.
     merge_mixed_new_states: true
     merge_lag_list: [1, 2, 5, 10, 20]
+    merge_min_valid_pairs: 50
     merge_transition_cutoff: 0.05
+    merge_require_bidirectional: true
+    merge_max_iterations: 100
 
-    # kNN backend. auto uses Torch/CUDA below size limits and sklearn otherwise.
-    knn_backend: auto        # auto | torch | cuda | sklearn
+    # Kinetics stage, existing-label reshape/split.
+    reshape_existing_basins: true
+    trim_existing_to_high_confidence_core: true
+    split_existing_kinetic_groups: true
+    min_kinetic_groups_to_split: 2
+    min_split_core_weight_fraction: 0.1
 
-    # Relabel plots.
-    make_relabel_plots: true
-    plot_unlabeled: false
+    # Kinetics stage, final consistency checks.
+    final_kinetic_check_enabled: true
+    final_check_lag_list: [1, 2, 5, 10, 20]
+    final_check_merge_enabled: true
+    final_check_merge_new_existing: true
+    final_check_merge_new_new: true
+    final_check_merge_all_labels: false
+    final_check_merge_max_iterations: 100
+    final_check_split_enabled: true
+    # Existing labels are already handled by basin_kinetic_groups. Checking
+    # only new labels avoids a second large all-label kNN pass.
+    final_check_split_labels: "new"
+    final_check_split_k_neighbors: 20
+    final_check_split_min_component_size: 100
+    final_check_split_min_component_weight: 0.0
+    final_check_split_min_components: 2
+    final_check_split_max_label_frames: 200000
+    final_check_split_require_low_exchange: true
+    final_check_split_max_exchange_probability: 0.05
+    final_check_split_min_component_valid_pairs: 1
+    final_check_report_unsplit_labels: false
+    final_check_split_knn_backend: "torch"
+    final_check_split_knn_device: "cuda:0"
+    final_check_split_torch_knn_query_batch: 4096
+    final_check_split_torch_knn_reference_batch: 32768
+    final_check_split_torch_knn_dtype: "float32"
 
-  # ---- Existing-basin kinetic reshaping ----
+    # kNN backend. auto uses Torch/CUDA below size limits and sklearn fallback.
+    random_seed: 0
+    knn_backend: "auto"      # auto | torch | cuda | sklearn
+    knn_device: "cuda:0"
+    torch_knn_auto_max_pairs: 1000000000
+    torch_knn_query_batch: 4096
+    torch_knn_reference_batch: 32768
+    torch_knn_dtype: "float32"
+
+    # Optional relabel diagnostic plots:
+    # - current entropy
+    # - time-lagged entropy
+    # - selected candidates
+    # - labels before/after relabeling
+    plotting:
+      dir: "plots"
+      format: "png"
+      space: "cv"          # cv | features
+      plane: []            # empty chooses first two dimensions
+      max_points: 20000
+      max_label_points: 100000
+
+  # ---- Existing-basin kinetic grouping ----
   basin_kinetic_groups:
     enabled: true
     lag_list: [1, 2, 5, 10, 20]
@@ -121,34 +183,15 @@ RELABEL:
     max_core_frames: 200000
     microstate_batch_size: 8192
     microstate_n_init: 5
+    macrostate_n_init: 10
+    cache_state_pair_positions: true
+    # Set to a positive value to sample lagged transition pairs per state/lag.
+    # 0 keeps exact transition counts.
+    max_transition_pairs_per_state_lag: 0
     min_macro_groups: 1
     max_macro_groups: 6
     min_slow_eigenvalue: 0.8
     min_eigengap: 0.05
     strong_eigengap: 0.12
-    # Drop a proposed split group to -1 if its weight fraction among the
-    # split groups is below this cutoff, e.g. 0.99/0.01 drops the 0.01 group.
-    min_split_core_weight_fraction: 0.1
     split_on_slow_mode_without_eigengap: true
     random_seed: 0
-
-  # ---- Plotting ----
-  make_plots: true
-  format: "png"
-
-  # CV plane for diagnostic plots (2 or 3 CV column names).
-  # Empty uses the first two CV columns found in the dataset.
-  planes: []
-  cv_plane: []                               # alias
-
-  # Plot appearance.
-  max_scatter_points: 20000
-  scatter_alpha: 0.35
-  scatter_size: 3.0
-  histogram_bins: 50
-  basin_cmap: "tab10"
-  3d_elev: 24.0
-  3d_azim: -60.0
-
-  # State naming for plot legends.
-  state_names: null

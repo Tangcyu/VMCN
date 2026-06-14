@@ -14,8 +14,8 @@ def _as_lag_list(value, fallback=None):
 def analysis_settings(config):
     """Compact shared settings for diagnose and relabel decisions.
 
-    New configs should prefer the top-level ``analysis`` section. Legacy
-    sections remain fallbacks so older YAML files keep running.
+    New configs should prefer the top-level ``analysis`` section. The narrower
+    legacy confidence/kinetics/uncertainty sections remain fallback inputs.
     """
 
     analysis = config.get("analysis", {})
@@ -23,7 +23,7 @@ def analysis_settings(config):
     kinetics = config.get("kinetics", {})
     uncertainty = config.get("uncertainty", {})
     basin = config.get("basin_kinetic_groups", {})
-    relabel = config.get("relabel", config.get("radical", {}))
+    relabel = config.get("relabel", {})
 
     q_cutoff = float(analysis.get("q_cutoff", confidence.get("q_label_cutoff", 0.7)))
     entropy_cutoff = float(

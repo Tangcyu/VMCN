@@ -2,81 +2,120 @@
 
 `tensorq.relabel` has two public workflows:
 
-- `scripts/relabel_diagnose.py`: run diagnostics and write confidence/kinetic
-  summaries.
-- `scripts/relabel.py`: apply the relabeling proposal and optionally write a
-  relabeled dataset for the next train -> relabel round.
+- `scripts/relabel_diagnose.py`: run label diagnostics and write
+  `diagnostic_summary.yaml`.
+- `scripts/relabel.py`: apply relabeling and write `relabel_summary.yaml`;
+  it may also write a relabeled dataset for the next train -> relabel round.
 
-Both workflows read the `RELABEL` section from a YAML config, load a TensorQ
-dataset plus trained committor-vector checkpoint, infer `q_values`, and use
-trajectory-safe lag pairs when kinetic analysis is requested.
+Both workflows read the `RELABEL` or `TENSORQ_RELABEL` section from a YAML
+config, load a TensorQ dataset plus a trained committor-vector checkpoint,
+infer `q_values`, and use trajectory-safe lag pairs for lagged entropy or
+kinetic analysis.
 
 ## Diagnostics
 
-Diagnostics are implemented in `label_diagnostics.py`.
+Diagnostics are implemented in `label_diagnostics.py` and serialized by
+`diagnostics_io.py`.
 
-Per-frame outputs include:
+The diagnostic summary contains:
 
-- `q_argmax`, `q_max`, normalized entropy, and committor confidence.
-- `label_consistency = q_{state_label}(x)` for currently labeled frames.
-- optional lagged entropy and lagged q-max fields.
-- `basin_kinetic_group`, when basin-internal kinetic grouping is enabled.
+- per-state committor consistency summaries
+- relabel hints from entropy and label consistency
+- optional lagged entropy classification
+- optional basin-internal kinetic group summaries
 
-State-level outputs are written to:
+The only diagnostic file written is:
 
-- `state_confidence_summary.csv`
-- `relabel_hints.csv`
-- `basin_kinetic_state_summary.csv`
-- `basin_kinetic_groups.csv`
-- `diagnostic_summary.json`
+- `diagnostic_summary.yaml`
 
-The legacy split/merge/missing-state detectors remain disabled. The supported
-automatic kinetic check is narrower: inside each label, collect high-confidence
-q-core frames, cluster them into feature-space microstates, build a local
-trajectory-safe transition matrix, and use the local MSM eigenvalue spectrum to
-estimate how many metastable groups are present. A clear slow-mode eigengap
-under one label suggests that the label may contain several kinetic metastates.
+Old CSV/JSON diagnostic files are removed from the output directory when a new
+diagnostic run writes its YAML summary.
 
 ## Relabeling
 
-Relabeling is implemented in `relabel.py` and exposed by `scripts/relabel.py`.
-The old conservative/radical split has been removed; the former radical
-confidence/kNN relabeler is now the single relabel path.
+Relabeling is implemented in `relabel.py`. The proposal returned by
+`propose_relabeling` is intentionally compact:
 
-The default relabeler follows the same logic as diagnostics:
+- `proposed_labels`
+- `changed_mask`
+- `masks`
+- `tables`
+- `diagnostics`
+- `scores`
 
-1. Removes whole labels only when most frames are unreliable.
-2. Marks high-entropy / low-commitment frames as unlabeled.
-3. Uses lagged behavior to separate transition-like review frames from
-   persistent uncertain review frames.
-4. Reshapes existing labels to high-confidence q cores.
-5. Splits an existing label only when the local spectral MSM finds a supported
-   slow-mode split.
+Automatic relabeling follows three stages.
 
-Persistent high-entropy regions are review candidates by default, not automatic
-new labels. The older kNN promotion path is still available for advanced runs
-with `relabel.promote_persistent_candidates: true`, but it is off in the
-recommended minimal config.
+### 1. Entropy
 
-Main relabel outputs are written with the `relabel_` prefix:
+Current normalized committor entropy `H(q(x)) / log(N)` marks unreliable frames.
+Before per-frame pruning, each current label is checked as a whole. If most
+frames in a label have low label consistency `q_label(x)` or high entropy, or
+if too little of the label remains as stable high-confidence core, the entire
+label is removed and its frames are set to `-1`.
+
+After label-level pruning, high-entropy labeled frames are set to `-1` before
+retraining so they no longer act as hard boundary labels.
+
+Trajectory-safe lagged entropy then classifies those uncertain frames:
+
+- high current entropy and high lagged entropy -> persistent uncertain region
+- high current entropy and low lagged entropy -> transition-like review region
+- insufficient lag statistics -> unresolved review region
+
+Only persistent uncertain frames are eligible for automatic new-core detection.
+
+### 2. Density
+
+Persistent high-entropy candidates are sampled for the graph if needed, grouped
+with kNN connected components, and trimmed to a weighted local-density core.
+Density shells are returned to `-1`.
+
+This is the only automatic new-label source.
+
+### 3. Kinetics
+
+Kinetic checks are applied after the entropy/density proposal:
+
+- existing labels can be reshaped to high-confidence q-cores
+- basin-internal kinetic groups can split a label when a supported slow mode is
+  present
+- split groups with less than `min_split_core_weight_fraction` of the parent
+  state's weight are assigned to `-1` instead of becoming a new state
+- final lagged checks can merge labels that behave as one metastate
+- final kNN kinetic checks can split labels with weakly exchanging components
+
+The basin-internal slow-mode check can be expensive on long trajectories. It
+caches standardized features and same-state lag-pair positions, and
+`basin_kinetic_groups.max_transition_pairs_per_state_lag` can cap the number of
+transition pairs used per state and lag. A value of `0` keeps exact transition
+counts; a positive value uses a reproducible sampled estimate.
+
+## Outputs
+
+Relabeling writes:
 
 - `relabel_summary.yaml`
-- `relabel_changed_frames.csv`
-- `relabel_removed_states.csv`
-- `relabel_basin_kinetic_state_summary.csv`
-- `relabel_reshaped_basin_groups.csv`
-- `relabel_reshaped_basin_core_frames.csv`
-- `relabel_reshaped_basin_shell_frames.csv`
-- `relabel_transition_like_candidate_frames.csv`
-- `relabel_persistent_candidate_review_frames.csv`
+- optional relabeled dataset when `relabel.write_relabel_dataset: true`
+- optional diagnostic plots when `relabel.make_plots: true`
 
-## Key Config Sections
+Relabel CSV frame dumps are no longer written. Existing generated
+`relabel_*.csv` files in the output directory are removed by `scripts/relabel.py`
+to avoid stale diagnostics.
 
-- `analysis`: the main shared decision knobs for both diagnose and relabel:
-  lag list, q/entropy/core cutoffs, minimum count, persistence fraction,
-  eigengap, maximum group count, and minimum group size.
-- `relabel`: dataset writing and whether to reshape/split existing labels.
+`relabel_summary.yaml` includes `removed_states`, so label-level inconsistency
+deletions remain auditable without writing separate CSV files.
 
-Legacy `confidence`, `kinetics`, `uncertainty`, and `basin_kinetic_groups`
-sections remain supported as fallbacks for older configs, but new configs should
-prefer `analysis`.
+The relabel diagnostic plots are focused on the current pipeline:
+
+- `relabel_entropy.png` with current entropy and time-lagged entropy panels
+- `relabel_candidates.png`
+- `relabel_labels_before_after.png`
+
+## Config Sections
+
+- `analysis`: shared thresholds for q consistency, entropy, lag list,
+  persistence, eigengap, and group size.
+- `relabel`: relabel-specific graph, density, kinetic-check, and dataset-output
+  settings.
+- `confidence`, `kinetics`, `uncertainty`, and `basin_kinetic_groups`: narrow
+  legacy fallback sections still read by diagnostics and shared settings.
