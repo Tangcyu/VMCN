@@ -1,0 +1,76 @@
+# Gradient pathways, weighted pathway clustering, and Voronoi merging.
+
+pipeline:
+  # The native gradpath runner performs pathfinding and weighted clustering in
+  # one call.  Thus clustering is reported as complete after pathfinding.
+  substeps: [pathfinding, clustering, merging]
+
+GRADPATH:
+  dataset: ./msmcv_out/06_core_labels/lag_50/m_4/dataset.pt
+  model: ./next_hit_train/next_hit_committor_best_checkpoint.pt
+  out_dir: ./gradpath_out
+  use_channel_subdir: true
+
+  # Manual channel mode.  Set automatic_pairs: true and p_jump to use every
+  # rate-constant channel above prob_threshold instead.
+  automatic_pairs: false
+  state_i: 0
+  state_j: 1
+  threshold: 0.20
+  max_points: 100
+  seed: 30
+  selection_mode: channel
+  model_input_space: features
+  device: cuda:0
+  dtype: float32
+  step_size: 0.05
+  max_steps: 300
+  target_q: 0.98
+  num_images: 50
+  smooth_iterations: 2
+  smooth_window: 5
+  reparameterize_after_smoothing: true
+  normalize_gradient: true
+  noise_scale: 0.0
+  cluster_distance_threshold: 0.25
+  save_plots: true
+  plot_axes: [0, 1]
+
+  # Automatic multi-pair mode (uncomment and set automatic_pairs: true):
+  # p_jump: ./next_hit_rate/P_jump.csv
+  # prob_threshold: 0.05
+  # max_pairs: null
+
+VORONOI_MERGE:
+  # Merging needs current/previous samples from two iterations.  It is
+  # disabled in this example until those paths are supplied.
+  enabled: false
+  images: ./gradpath_out/state_0_1/cluster_centers
+  image_kind: center
+  flatten_images: false
+  samples: ./iteration_k_samples.npy
+  previous_samples: ./iteration_k_minus_1_samples.npy
+  out_dir: ./voronoi_merge_out/state_0_1_iter_k
+  model_input_space: features
+  periods: [null, null]
+  wrap_bounds: [null, null]
+  pathway_iteration:
+    enabled: true
+    max_iterations: 10
+    convergence_tol: 1.0e-4
+    lag: 1
+    terminal_image_margin: 1
+    exchange_weight_mode: count
+    min_exchange_count: 1.0
+    min_exchange_probability: 0.0
+    fixed_endpoints: true
+    num_images: 20
+    smooth_iterations: 2
+    smooth_window: 5
+    periodic_geometry: minimum_image
+  plotting:
+    enabled: true
+    plot_axes: [0, 1]
+  pseudocount: 0.0
+  eps: 1.0e-12
+  chunk_size: 65536

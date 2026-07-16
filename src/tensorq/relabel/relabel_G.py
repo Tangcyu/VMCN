@@ -44,7 +44,9 @@ def propose_relabeling(*args, **kwargs):
     proposal["diagnostics"]["uncertainty_score"] = "normalized_gini"
     proposal["diagnostics"]["cutoff_note"] = (
         "analysis.entropy_cutoff and analysis.lagged_entropy_cutoff were "
-        "interpreted as normalized Gini cutoffs in relabel_G.py."
+        "interpreted as normalized Gini cutoffs in relabel_G.py. Candidate "
+        "missing-state clustering still follows the base relabel pipeline, "
+        "including kinetic spectral clustering when enabled."
     )
     return proposal
 
@@ -65,6 +67,7 @@ def run_relabel(*args, **kwargs):
     summary["notes"] = [
         "This test run used normalized Gini impurity G(x) instead of entropy H(x).",
         "The same config keys were reused; entropy_cutoff and lagged_entropy_cutoff are Gini cutoffs here.",
+        "Candidate missing states use the same kinetic clustering settings as relabel.py.",
         *summary.get("notes", []),
     ]
     output_dir = ensure_dir(config.get("output_dir", "relabel_out"))

@@ -1,0 +1,90 @@
+# MSM -> PCCA+ -> TensorQ core-label dataset.
+# This file is consumed by tensorq.MSMlabel.pipeline.run_pipeline(..., stage="all").
+
+project:
+  out_dir: ./msmcv_out
+  seed: 2026
+  force: false
+  device: cuda
+
+data:
+  cvs: ["CV1", "CV2"]
+  tables:
+    - /path/to/frame_weights.csv
+  colvars: []
+  folders: []
+  match_colvars: "*.colvars.traj"
+  stride: 1
+  discard_before_step: null
+  step_column: step
+  weight_column: weight
+  infer_trajectories:
+    enabled: true
+    method: step_reset
+    step_column: step
+  model:
+    source: cvs
+    dimensions: all
+
+normalization:
+  method: standard
+  eps: 1.0e-8
+
+clustering:
+  n_microstates: 400
+  max_iter: 100
+  batch_size: 65536
+  device: cuda
+  use_weights: true
+
+msm:
+  lags: [5, 10, 20, 50, 100]
+  n_timescales: 12
+  use_weights: true
+  mask_zero_weight_origins: true
+  reversible: true
+  pseudocount: 1.0e-8
+
+pcca:
+  selected_lag: 50
+  m_values: [2, 3, 4, 5, 6]
+  # Set single_m to an integer to test one macrostate count.
+  single_m: null
+  exclude_zero_weight_microstates: true
+  use_deeptime: true
+
+ck_test:
+  multiples: [1, 2, 3, 4, 5]
+
+spectral_analysis:
+  enabled: true
+  selected_lag: 50
+  n_eigenvalues: 12
+  max_processes: 8
+
+core_labeling:
+  enabled: true
+  selection_mode: density_connected
+  core_fraction: 0.05
+  core_by: count
+  k_neighbors: 25
+  density_reference_points: 5000
+  density_batch_size: 4096
+  density_backend: auto
+  device: auto
+  connected_core:
+    graph_k_neighbors: 10
+    max_edge_distance: null
+    edge_distance_scale: 2.5
+    edge_distance_quantile: 0.90
+    min_pocket_size: 10
+    split_disconnected_pockets: false
+    max_pockets_per_macrostate: null
+  feature_source: model
+  standardize: true
+  save_format: pt
+
+plotting:
+  cv_pairs:
+    - ["CV1", "CV2"]
+  max_points: 200000

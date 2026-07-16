@@ -559,11 +559,27 @@ NEXT_HIT_RATE:
   weighted_hits: true
   labeled_exits_only: false
 
-  # Error analysis. Direct weighted/counting standard errors are combined with
-  # standard deviations across contiguous lagged-pair slices.
+  # Optional pruning before final generator/MFPT kinetics. Edges are considered
+  # for removal only after negative-rate sanitization and before K/MFPT are
+  # assembled. Unfiltered matrices are still written as *_unfiltered outputs.
+  kinetic_edge_filter:
+    enabled: false
+    min_jump_probability: 1.0e-3
+    min_rate_zscore: 1.0          # null disables this additional criterion
+    preserve_connectivity: true
+
+  # Error analysis. The default delete-one-block jackknife recomputes rates
+  # after omitting one contiguous lagged-pair block at a time. This is more
+  # stable for k = J / pi than estimating k on short slices, where rare-state
+  # pi values can become tiny and inflate k_std.
+  # Options: "block_jackknife", "slice_sem", "direct", "combined".
+  # Threshold-profile variance is a diagnostic across isocommittor surfaces,
+  # not a sampling error, so it is excluded from *_std by default.
   error_analysis: true
-  error_n_slices: 10
-  error_min_pairs_per_slice: 1
+  error_estimator: "block_jackknife"
+  error_n_blocks: 10
+  error_min_pairs_per_block: 1
+  include_threshold_variance_in_error: false
 
   # Plot outputs.
   make_plots: true

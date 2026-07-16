@@ -86,16 +86,52 @@ RELABEL:
     candidate_lagged_entropy_min_valid_lags: 1
     candidate_no_valid_lag_policy: "review"
 
-    # Density stage. Persistent high-lagged-entropy candidates are grouped in
-    # graph_space and trimmed to weighted local-density cores.
+    # Candidate clustering stage. Persistent high-lagged-entropy candidates are
+    # split by slow kinetic modes first, then each kinetic component is trimmed
+    # to a weighted local-density core. Set candidate_kinetic_clustering_enabled
+    # false to fall back to the old feature-space kNN connected components.
     promote_missing_metastate_candidates: true
     graph_space: "auto"
     max_graph_frames: 20000
     k_neighbors: 20
     candidate_graph_mode: "mutual_knn"
-    candidate_cluster_core_fraction: 0.5
+    candidate_cluster_core_fraction: 1.0
     min_new_core_size: 100
     min_new_core_weight: 0.0
+
+    # Kinetic clustering for missing-state candidates.
+    # For slow systems, make these lags comparable to the slow process; too
+    # short a lag can merge or cut basins based on fast local motion.
+    candidate_kinetic_clustering_enabled: true
+    candidate_kinetic_lag_list: null
+    candidate_kinetic_analysis_lag: null
+    candidate_kinetic_min_valid_pairs: 50
+    candidate_kinetic_min_microstates: 6
+    candidate_kinetic_max_microstates: 50
+    candidate_kinetic_target_frames_per_microstate: 200
+    candidate_kinetic_min_frames_per_microstate: 20
+    candidate_kinetic_max_core_frames: 20000
+    candidate_kinetic_microstate_batch_size: 8192
+    candidate_kinetic_microstate_n_init: 2
+    candidate_kinetic_macrostate_n_init: 5
+    candidate_kinetic_min_macro_groups: 1
+    candidate_kinetic_max_macro_groups: 6
+    candidate_kinetic_min_slow_eigenvalue: null
+    candidate_kinetic_min_eigengap: null
+    candidate_kinetic_strong_eigengap: 0.12
+    candidate_kinetic_split_on_slow_mode_without_eigengap: true
+    candidate_kinetic_max_transition_pairs: 0
+    candidate_kinetic_fallback_to_knn: true
+    candidate_kinetic_n_groups: null
+    candidate_kinetic_allow_final_split: false
+    # Core selection for kinetic missing-state candidates.
+    # "slow" trims each proposed new core by density in the slow spectral
+    # embedding of the candidate microstate transition matrix. "graph" keeps
+    # the old behavior, where final density trimming uses graph_space features.
+    candidate_core_space: "slow"      # slow | graph
+    candidate_slow_core_max_dims: null
+
+    # Density core selection after candidate clustering.
     density_core_enabled: true
     density_core_fraction: 0.5
     density_core_min_weight: 0.0

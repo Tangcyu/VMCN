@@ -12,6 +12,8 @@ dependencies = [
   "numpy",
   "pandas",
   "pyyaml",
+  "scikit-learn",
+  "scipy",
   "torch",
   "tqdm",
 ]
@@ -38,6 +40,10 @@ tensorq-pairwise-train = "tensorq.pairwise.train:main"
 tensorq-pairwise-infer = "tensorq.pairwise.infer:main"
 tensorq-pairwise-plot = "tensorq.pairwise.plot:main"
 tensorq-pairwise-rate = "tensorq.pairwise.rate_constant:main"
+tensorq-msmlabel = "tensorq.MSMlabel.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"tensorq.MSMlabel" = ["README.md", "config.template.yaml"]

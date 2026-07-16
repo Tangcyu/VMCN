@@ -1,0 +1,12 @@
+# Main dispatcher configuration.  Each stage has its own editable YAML.
+# Run from the Tensorq.v.0.1 directory:
+#   python run.py --step 0
+#   python run.py --step 1
+#   python run.py --step 2
+#   python run.py --step 3
+
+pipeline:
+  msmcorelabel: configs/0.MSMcorelabel.yaml
+  committorvector: configs/1.Committorvector.yaml
+  gradpath: configs/2.Gradpath.yaml
+  relabel: configs/3.Relabel.yaml

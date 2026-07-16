@@ -1,0 +1,78 @@
+# Next-hit committor-vector workflow.
+# q_j(x) is the probability that x next reaches state j.
+
+pipeline:
+  # fit_rate is optional and requires the rate output from rate_constant.
+  substeps: [train, infer, plot, rate_constant, fit_rate]
+
+NEXT_HIT_COMMITTOR:
+  dataset_path: ./msmcv_out/06_core_labels/lag_50/m_4/dataset.pt
+  out_dir: ./next_hit_train
+  label: next_hit_committor
+  device: cuda:0
+  seed: 0
+  model_input_space: features
+  dataset_stride: 1
+  lag: 1
+  require_labeled: none
+  val_ratio: 0.1
+  batch_size: 2048
+  epochs: 500
+  patience: 30
+  lr: 1.0e-3
+  weight_decay: 1.0e-6
+  use_amp: true
+  model:
+    hidden: [256, 256, 128]
+    activation: elu
+    dropout: 0.0
+    output_normalization: softmax
+  loss:
+    lambda_dir: 1.0
+    lambda_bc: 10.0
+    lambda_simplex: 0.0
+    lambda_flux: 0.1
+    weighted_dirichlet: true
+    n_thresholds: 9
+    flux_eps: 0.02
+
+NEXT_HIT_INFER:
+  dataset: ./msmcv_out/06_core_labels/lag_50/m_4/dataset.pt
+  model: ./next_hit_train/next_hit_committor_best_checkpoint.pt
+  out_dir: ./next_hit_infer
+  device: cuda:0
+  batch_size: 65536
+  save_csv: true
+  save_reactive_weights: true
+
+NEXT_HIT_PLOT:
+  dataset: ./msmcv_out/06_core_labels/lag_50/m_4/dataset.pt
+  model: ./next_hit_train/next_hit_committor_best_checkpoint.pt
+  out_dir: ./next_hit_plots
+  device: cuda:0
+  planes: []
+  plot_reaction_tubes: true
+
+NEXT_HIT_RATE:
+  dataset: ./msmcv_out/06_core_labels/lag_50/m_4/dataset.pt
+  model: ./next_hit_train/next_hit_committor_best_checkpoint.pt
+  out_dir: ./next_hit_rate
+  device: cuda:0
+  lag: 1
+  lag_reference: original_frames
+  n_thresholds: 9
+  flux_eps: 0.02
+  divide_by_tau: true
+  error_analysis: true
+  error_estimator: block_jackknife
+  error_n_blocks: 10
+
+NEXT_HIT_FIT_RATE:
+  dataset: ./msmcv_out/06_core_labels/lag_50/m_4/dataset.pt
+  model: ./next_hit_train/next_hit_committor_best_checkpoint.pt
+  out_dir: ./next_hit_fit_rate
+  device: cuda:0
+  lag: 1
+  lag_reference: original_frames
+  rate_dir: ./next_hit_rate
+  fit_init: flux

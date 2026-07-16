@@ -1,0 +1,99 @@
+# Label diagnostics and confidence-based relabeling.
+# H is normalized committor entropy; G is normalized Gini impurity.
+
+pipeline:
+  substeps: [diagnose, relabel_entropy, relabel_gini]
+
+RELABEL:
+  dataset: ./msmcv_out/06_core_labels/lag_50/m_4/dataset.pt
+  model: ./next_hit_train/next_hit_committor_best_checkpoint.pt
+  output_dir: ./relabel_entropy
+  device: cuda:0
+  batch_size: 65536
+  dataset_stride: 1
+  n_states: null
+  model_input_space: features
+  cvs_to_use: []
+  periodic_cvs: false
+
+  analysis:
+    lag_list: [1, 2, 5, 10, 20]
+    q_cutoff: 0.7
+    entropy_cutoff: 0.5
+    lagged_entropy_cutoff: 0.5
+    lagged_qmax_cutoff: 0.7
+    core_cutoff: 0.8
+    min_count: 50
+    persistent_fraction: 0.5
+    eigengap: 0.05
+    max_groups: 6
+    min_group_size: 50
+    min_slow_eigenvalue: 0.8
+    random_seed: 0
+
+  diagnostics_output_dir: ./relabel_diagnostics
+  diagnostics:
+    compute_lagged_entropy: true
+    compute_basin_kinetic_groups: true
+    profile_timing: true
+
+  relabel:
+    write_relabel_dataset: true
+    output_dataset: ./relabel_entropy/relabeled_dataset.pt
+    compact_labels: true
+    make_plots: true
+    remove_inconsistent_states: true
+    remove_problem_fraction_cutoff: 0.9
+    remove_min_stable_fraction: 0.5
+    promote_missing_metastate_candidates: true
+    graph_space: auto
+    max_graph_frames: 20000
+    k_neighbors: 20
+    candidate_graph_mode: mutual_knn
+    candidate_cluster_core_fraction: 1.0
+    min_new_core_size: 100
+    density_core_enabled: true
+    density_core_fraction: 0.5
+    merge_mixed_new_states: true
+    merge_lag_list: [1, 2, 5, 10, 20]
+    merge_min_valid_pairs: 50
+    merge_transition_cutoff: 0.05
+    merge_require_bidirectional: true
+    reshape_existing_basins: true
+    trim_existing_to_high_confidence_core: true
+    split_existing_kinetic_groups: true
+    final_kinetic_check_enabled: true
+    final_check_lag_list: [1, 2, 5, 10, 20]
+    final_check_merge_enabled: true
+    final_check_split_enabled: true
+    final_check_split_labels: new
+    final_check_split_k_neighbors: 20
+    final_check_split_min_component_size: 100
+    knn_backend: auto
+    knn_device: cuda:0
+    torch_knn_query_batch: 4096
+    torch_knn_reference_batch: 32768
+
+  basin_kinetic_groups:
+    enabled: true
+    lag_list: [1, 2, 5, 10, 20]
+    q_core_cutoff: 0.8
+    q_core_mode: own_high
+    require_q_argmax: true
+    min_group_size: 50
+    min_valid_pairs: 50
+    min_microstates: 8
+    max_microstates: 100
+    max_macro_groups: 6
+    min_slow_eigenvalue: 0.8
+    min_eigengap: 0.05
+    random_seed: 0
+
+# Method-specific output overrides used by run.py.  The same thresholds and
+# kinetic checks apply to both methods; only the uncertainty score changes.
+entropy:
+  output_dir: ./relabel_entropy
+  output_dataset: ./relabel_entropy/relabeled_dataset.pt
+gini:
+  output_dir: ./relabel_gini
+  output_dataset: ./relabel_gini/relabeled_dataset.pt

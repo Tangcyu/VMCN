@@ -285,6 +285,7 @@ def _iteratively_merge_kinetically_duplicate_labels(
     frame_index,
     weights,
     config,
+    protected_new_labels=None,
 ):
     relabel_cfg = _relabel_cfg(config)
     if not bool(relabel_cfg.get("final_kinetic_check_enabled", True)):
@@ -303,6 +304,14 @@ def _iteratively_merge_kinetically_duplicate_labels(
         return labels, []
 
     original_labels = set(int(label) for label in original_labels if int(label) >= 0)
+    protected_new_labels = set(
+        int(label)
+        for label in (protected_new_labels or [])
+        if int(label) >= 0
+    )
+    protect_split_existing = bool(
+        relabel_cfg.get("protect_split_existing_labels_from_merge", True)
+    )
     merge_new_existing = bool(relabel_cfg.get("final_check_merge_new_existing", True))
     merge_new_new = bool(relabel_cfg.get("final_check_merge_new_new", True))
     merge_all = bool(relabel_cfg.get("final_check_merge_all_labels", False))
@@ -356,6 +365,10 @@ def _iteratively_merge_kinetically_duplicate_labels(
                 allowed = allowed or (merge_new_new and not i_original and not j_original)
                 if not allowed:
                     continue
+                if protect_split_existing and (i_original != j_original):
+                    new_label = int(label_j) if i_original else int(label_i)
+                    if new_label in protected_new_labels:
+                        continue
 
                 decision = _pair_mixing_decision_from_matrices(
                     label_i,

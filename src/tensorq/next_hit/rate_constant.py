@@ -575,6 +575,117 @@ def compute_jump_probabilities(K: np.ndarray) -> np.ndarray:
     return P
 
 
+def _reachability_from_rates(k_direct: np.ndarray) -> np.ndarray:
+    rates = np.asarray(k_direct, dtype=np.float64)
+    reach = (rates > 0.0) & np.isfinite(rates)
+    np.fill_diagonal(reach, True)
+    n_states = reach.shape[0]
+    for via in range(n_states):
+        reach |= reach[:, [via]] & reach[[via], :]
+    return reach
+
+
+def _resolve_kinetic_edge_filter(config: dict[str, Any]) -> dict[str, Any]:
+    cfg = config.get("kinetic_edge_filter", {})
+    if cfg is None:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        raise ValueError("kinetic_edge_filter must be a mapping.")
+    enabled = bool(cfg.get("enabled", config.get("kinetic_edge_filter_enabled", False)))
+    min_p = float(cfg.get("min_jump_probability", config.get("kinetic_min_jump_probability", 0.0)) or 0.0)
+    if min_p < 0:
+        raise ValueError("kinetic_edge_filter.min_jump_probability must be >= 0.")
+    min_z_raw = cfg.get("min_rate_zscore", config.get("kinetic_min_rate_zscore", None))
+    min_z = None if min_z_raw is None else float(min_z_raw)
+    if min_z is not None and min_z < 0:
+        raise ValueError("kinetic_edge_filter.min_rate_zscore must be >= 0.")
+    preserve = bool(cfg.get("preserve_connectivity", config.get("kinetic_filter_preserve_connectivity", True)))
+    return {
+        "enabled": enabled,
+        "min_jump_probability": min_p,
+        "min_rate_zscore": min_z,
+        "preserve_connectivity": preserve,
+    }
+
+
+def filter_kinetic_edges(
+    k_direct: np.ndarray,
+    P_jump: np.ndarray,
+    *,
+    k_direct_std: np.ndarray | None = None,
+    config: dict[str, Any] | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    cfg = _resolve_kinetic_edge_filter({} if config is None else config)
+    k = np.asarray(k_direct, dtype=np.float64).copy()
+    P = np.asarray(P_jump, dtype=np.float64)
+    if k.ndim != 2 or k.shape[0] != k.shape[1]:
+        raise ValueError(f"k_direct must be a square matrix; got {k.shape}.")
+    if P.shape != k.shape:
+        raise ValueError(f"P_jump shape {P.shape} does not match k_direct shape {k.shape}.")
+    n_states = k.shape[0]
+    offdiag = ~np.eye(n_states, dtype=bool)
+    removed = np.zeros_like(k, dtype=bool)
+    stats: dict[str, Any] = {
+        "enabled": bool(cfg["enabled"]),
+        "min_jump_probability": float(cfg["min_jump_probability"]),
+        "min_rate_zscore": cfg["min_rate_zscore"],
+        "preserve_connectivity": bool(cfg["preserve_connectivity"]),
+        "n_candidate_edges": 0,
+        "n_removed_edges": 0,
+        "n_preserved_for_connectivity": 0,
+        "removed_edges": [],
+    }
+    active_p = float(cfg["min_jump_probability"]) > 0.0
+    active_z = cfg["min_rate_zscore"] is not None and float(cfg["min_rate_zscore"]) > 0.0
+    if not cfg["enabled"] or not (active_p or active_z):
+        return k, removed, stats
+
+    candidate = offdiag & (k > 0.0) & np.isfinite(k)
+    if active_p:
+        candidate &= np.isfinite(P) & (P < float(cfg["min_jump_probability"]))
+    zscore = np.full_like(k, np.inf, dtype=np.float64)
+    if active_z:
+        if k_direct_std is None:
+            raise ValueError("kinetic_edge_filter.min_rate_zscore requires k_direct_std.")
+        std = np.asarray(k_direct_std, dtype=np.float64)
+        if std.shape != k.shape:
+            raise ValueError(f"k_direct_std shape {std.shape} does not match k_direct shape {k.shape}.")
+        with np.errstate(divide="ignore", invalid="ignore"):
+            zscore = np.abs(k) / std
+        zscore[(std == 0.0) & (k > 0.0)] = np.inf
+        candidate &= np.isfinite(zscore) & (zscore < float(cfg["min_rate_zscore"]))
+
+    stats["n_candidate_edges"] = int(np.sum(candidate))
+    if not np.any(candidate):
+        return k, removed, stats
+
+    original_reach = _reachability_from_rates(k)
+    candidate_edges = [(float(P[i, j]) if np.isfinite(P[i, j]) else np.inf, int(i), int(j)) for i, j in np.argwhere(candidate)]
+    candidate_edges.sort()
+    for _pij, i, j in candidate_edges:
+        old = float(k[i, j])
+        k[i, j] = 0.0
+        if cfg["preserve_connectivity"]:
+            new_reach = _reachability_from_rates(k)
+            if not np.all(new_reach[original_reach]):
+                k[i, j] = old
+                stats["n_preserved_for_connectivity"] = int(stats["n_preserved_for_connectivity"]) + 1
+                continue
+        removed[i, j] = True
+        edge_stats = {
+            "state_i": int(i),
+            "state_j": int(j),
+            "k_direct": old,
+            "P_jump": float(P[i, j]) if np.isfinite(P[i, j]) else np.nan,
+        }
+        if active_z:
+            edge_stats["rate_zscore"] = float(zscore[i, j]) if np.isfinite(zscore[i, j]) else np.nan
+        stats["removed_edges"].append(edge_stats)
+
+    stats["n_removed_edges"] = int(np.sum(removed))
+    return k, removed, stats
+
+
 def compute_mfpt_matrix(K: np.ndarray) -> np.ndarray:
     """
     Continuous-time MFPTs from the full generator.
@@ -650,6 +761,35 @@ def _nanstd(values: list[np.ndarray]) -> np.ndarray:
     return out
 
 
+def _nansem(values: list[np.ndarray]) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.shape[0] < 2:
+        return np.full(arr.shape[1:], np.nan, dtype=np.float64)
+    std = _nanstd(values)
+    count = np.sum(np.isfinite(arr), axis=0)
+    return np.divide(std, np.sqrt(count), out=np.full_like(std, np.nan), where=count > 1)
+
+
+def _nanjackknife_std(values: list[np.ndarray]) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.shape[0] < 2:
+        return np.full(arr.shape[1:], np.nan, dtype=np.float64)
+    std = _nanstd(values)
+    count = np.sum(np.isfinite(arr), axis=0)
+    factor = np.divide(count - 1, np.sqrt(count), out=np.zeros_like(std), where=count > 1)
+    out = std * factor
+    out[count <= 1] = np.nan
+    return out
+
+
+def _mean_std_from_component_stds(stds: np.ndarray, axis: int = 1) -> np.ndarray:
+    stds = np.asarray(stds, dtype=np.float64)
+    finite = np.isfinite(stds)
+    count = np.sum(finite, axis=axis)
+    sum_var = np.sum(np.where(finite, stds * stds, 0.0), axis=axis)
+    return np.divide(np.sqrt(sum_var), count, out=np.full(count.shape, np.nan, dtype=np.float64), where=count > 0)
+
+
 def _combine_std(*parts: np.ndarray | None) -> np.ndarray | None:
     arrays = [np.asarray(part, dtype=np.float64) for part in parts if part is not None]
     if not arrays:
@@ -663,6 +803,51 @@ def _combine_std(*parts: np.ndarray | None) -> np.ndarray | None:
     out = np.sqrt(total)
     out[~any_finite] = np.nan
     return out
+
+
+def _prefer_std(primary: np.ndarray | None, fallback: np.ndarray | None) -> np.ndarray | None:
+    if primary is None:
+        return None if fallback is None else np.asarray(fallback, dtype=np.float64)
+    primary_arr = np.asarray(primary, dtype=np.float64)
+    if fallback is None:
+        return primary_arr
+    fallback_arr = np.asarray(fallback, dtype=np.float64)
+    return np.where(np.isfinite(primary_arr), primary_arr, fallback_arr)
+
+
+def _resolve_error_estimator(config: dict[str, Any]) -> str:
+    raw = str(config.get("error_estimator", config.get("error_method", "block_jackknife"))).lower()
+    aliases = {
+        "jackknife": "block_jackknife",
+        "delete_block_jackknife": "block_jackknife",
+        "delete-one-block": "block_jackknife",
+        "delete_one_block": "block_jackknife",
+        "slices": "slice_sem",
+        "slice": "slice_sem",
+        "lagged_pair_slices": "slice_sem",
+        "sem": "slice_sem",
+        "weighted": "direct",
+        "counting": "direct",
+        "weighted_counting": "direct",
+        "combined": "combined",
+        "quadrature": "combined",
+    }
+    estimator = aliases.get(raw, raw)
+    if estimator not in {"block_jackknife", "slice_sem", "direct", "combined"}:
+        raise ValueError("error_estimator must be 'block_jackknife', 'slice_sem', 'direct', or 'combined'.")
+    return estimator
+
+
+def _pick_std(
+    direct: np.ndarray | None,
+    resampled: np.ndarray | None,
+    estimator: str,
+) -> np.ndarray | None:
+    if estimator == "combined":
+        return _combine_std(direct, resampled)
+    if estimator == "direct":
+        return None if direct is None else np.asarray(direct, dtype=np.float64)
+    return _prefer_std(resampled, direct)
 
 
 def _weighted_mean_std(values: np.ndarray, weights: np.ndarray, mean: np.ndarray) -> np.ndarray:
@@ -752,11 +937,21 @@ def _rate_matrices_from_estimates(
     C_abs_mean: np.ndarray,
     pi: np.ndarray,
     time_unit: str,
+    kinetic_edge_filter: dict[str, Any] | None = None,
 ) -> dict[str, np.ndarray]:
     _, J_matrix, k_direct = build_rate_table(pairs, J, np.zeros(len(pairs), dtype=np.float64), pi, time_unit)
     k_direct, _rate_sanitize = sanitize_rate_matrix(k_direct)
     C_matrix = matrix_from_pair_values(n_states, pairs, C_mean, fill=0.0)
     C_abs_matrix = matrix_from_pair_values(n_states, pairs, C_abs_mean, fill=0.0)
+    K_unfiltered = assemble_generator(k_direct)
+    P_jump_unfiltered = compute_jump_probabilities(K_unfiltered)
+    slice_filter = dict(kinetic_edge_filter or {})
+    slice_filter["min_rate_zscore"] = None
+    k_direct, _removed, _filter_stats = filter_kinetic_edges(
+        k_direct,
+        P_jump_unfiltered,
+        config={"kinetic_edge_filter": slice_filter},
+    )
     K = assemble_generator(k_direct)
     P_jump = compute_jump_probabilities(K)
     mfpt = compute_mfpt_matrix(K)
@@ -848,6 +1043,7 @@ def estimate_slice_rate_std(
     min_pairs: int,
     device: torch.device | str | None,
     dtype: torch.dtype,
+    kinetic_edge_filter: dict[str, Any] | None = None,
 ) -> tuple[dict[str, np.ndarray], int]:
     collected: dict[str, list[np.ndarray]] = {
         "pi": [],
@@ -905,13 +1101,123 @@ def estimate_slice_rate_std(
         collected["exit_counts"].append(s_exit_counts.astype(np.float64))
         collected["exit_weight"].append(s_exit_weight)
         for name, value in _rate_matrices_from_estimates(
-            n_states, pairs, s_J, s_C_mean, s_C_abs_mean, s_pi, time_unit
+            n_states, pairs, s_J, s_C_mean, s_C_abs_mean, s_pi, time_unit, kinetic_edge_filter
         ).items():
             collected[name].append(value)
     used = len(collected["pi"])
     if used < 2:
         return {}, used
-    return {name: _nanstd(values) for name, values in collected.items()}, used
+    return {name: _nansem(values) for name, values in collected.items()}, used
+
+
+def estimate_block_jackknife_rate_std(
+    q: np.ndarray,
+    weights: np.ndarray,
+    state: np.ndarray,
+    idx0: np.ndarray,
+    idx1: np.ndarray,
+    n_states: int,
+    pairs: list[tuple[int, int]],
+    thresholds: np.ndarray,
+    *,
+    tau: float,
+    divide_by_tau: bool,
+    eps: float,
+    surface: str,
+    chunk_size: int,
+    weighted_flux: bool,
+    weighted_hits: bool,
+    labeled_exits_only: bool,
+    pi_mode: str,
+    time_unit: str,
+    n_blocks: int,
+    min_pairs: int,
+    device: torch.device | str | None,
+    dtype: torch.dtype,
+    kinetic_edge_filter: dict[str, Any] | None = None,
+) -> tuple[dict[str, np.ndarray], int]:
+    """
+    Delete-one-contiguous-block jackknife standard errors.
+
+    Each replicate drops one lagged-pair block and recomputes the full rate
+    estimator on the remaining data. This is more stable for ratio estimates
+    than computing rates on short slices, because pi_i is estimated from nearly
+    the full trajectory in every replicate.
+    """
+    pair_blocks = _slice_lagged_pairs(idx0, n_blocks, min_pairs)
+    if len(pair_blocks) < 2:
+        return {}, len(pair_blocks)
+
+    collected: dict[str, list[np.ndarray]] = {
+        "pi": [],
+        "T_hit": [],
+        "exit_counts": [],
+        "exit_weight": [],
+        "J_thresholds": [],
+        "J_matrix": [],
+        "C_matrix": [],
+        "C_abs_matrix": [],
+        "k_direct": [],
+        "k_matrix": [],
+        "K": [],
+        "P_jump": [],
+        "MFPT": [],
+        "k_mfpt": [],
+    }
+    all_pair_ids = np.arange(idx0.shape[0], dtype=np.int64)
+    for omitted in pair_blocks:
+        keep_mask = np.ones(idx0.shape[0], dtype=bool)
+        keep_mask[omitted] = False
+        keep_pair_ids = all_pair_ids[keep_mask]
+        if keep_pair_ids.size < int(min_pairs):
+            continue
+        jk_idx0 = idx0[keep_pair_ids]
+        jk_idx1 = idx1[keep_pair_ids]
+        frame_ids = np.unique(jk_idx0)
+        if frame_ids.size == 0:
+            continue
+        jk_pi = estimate_pi(q[frame_ids], weights[frame_ids], state[frame_ids], n_states, mode=pi_mode)
+        jk_flux = estimate_flux_profiles(
+            q=q,
+            weights=weights,
+            idx0=jk_idx0,
+            idx1=jk_idx1,
+            pairs=pairs,
+            thresholds=thresholds,
+            eps=eps,
+            tau=tau,
+            divide_by_tau=divide_by_tau,
+            surface=surface,
+            chunk_size=chunk_size,
+            weighted=weighted_flux,
+            return_current=True,
+            device=device,
+            dtype=dtype,
+        )
+        jk_J, _jk_variance, jk_C_mean, jk_C_abs_mean = jk_flux
+        jk_T_hit, jk_exit_counts, jk_exit_weight = estimate_transition_hit_matrix(
+            q=q,
+            weights=weights,
+            state=state,
+            idx0=jk_idx0,
+            idx1=jk_idx1,
+            n_states=n_states,
+            weighted=weighted_hits,
+            labeled_exits_only=labeled_exits_only,
+        )
+        collected["pi"].append(jk_pi)
+        collected["T_hit"].append(jk_T_hit)
+        collected["exit_counts"].append(jk_exit_counts.astype(np.float64))
+        collected["exit_weight"].append(jk_exit_weight)
+        for name, value in _rate_matrices_from_estimates(
+            n_states, pairs, jk_J, jk_C_mean, jk_C_abs_mean, jk_pi, time_unit, kinetic_edge_filter
+        ).items():
+            collected[name].append(value)
+
+    used = len(collected["pi"])
+    if used < 2:
+        return {}, used
+    return {name: _nanjackknife_std(values) for name, values in collected.items()}, used
 
 
 def build_rate_std_table(
@@ -1307,15 +1613,8 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
         table.loc[row_idx, "k_ij"] = float(k_direct[i, j])
     C_matrix = matrix_from_pair_values(n_states, pairs, C_mean, fill=0.0)
     C_abs_matrix = matrix_from_pair_values(n_states, pairs, C_abs_mean, fill=0.0)
-    K = assemble_generator(
-        k_direct,
-        negative_policy=str(config.get("negative_rate_policy", "clip")),
-        negative_tol=float(config.get("negative_rate_tolerance", 0.0)),
-    )
-    P_jump = compute_jump_probabilities(K)
-    mfpt = compute_mfpt_matrix(K)
-    k_mfpt = compute_mfpt_rate_matrix(mfpt)
-    table = add_mfpt_rates_to_table(table, pairs, k_mfpt)
+    k_direct_unfiltered = k_direct.copy()
+    kinetic_edge_filter_cfg = _resolve_kinetic_edge_filter(config)
 
     pi_direct_std = estimate_pi_std(
         q_weighted, weights_weighted, state_weighted, pi, n_states, mode=str(config.get("pi_mode", "labels"))
@@ -1331,8 +1630,9 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
         weighted=bool(config.get("weighted_hits", config.get("weighted_flux", True))),
         labeled_exits_only=bool(config.get("labeled_exits_only", False)),
     )
-    Jbar_direct_std = np.sqrt(np.nanmean(J_thresholds_direct_std * J_thresholds_direct_std, axis=1))
-    Jbar_direct_std = np.sqrt(Jbar_direct_std * Jbar_direct_std + np.maximum(variance, 0.0))
+    Jbar_direct_std = _mean_std_from_component_stds(J_thresholds_direct_std, axis=1)
+    if bool(config.get("include_threshold_variance_in_error", False)):
+        Jbar_direct_std = np.sqrt(Jbar_direct_std * Jbar_direct_std + np.maximum(variance, 0.0))
     J_matrix_direct_std = matrix_from_pair_values(n_states, pairs, Jbar_direct_std, fill=np.nan)
     C_matrix_direct_std = matrix_from_pair_values(n_states, pairs, C_direct_std, fill=np.nan)
     C_abs_matrix_direct_std = matrix_from_pair_values(n_states, pairs, C_abs_direct_std, fill=np.nan)
@@ -1346,45 +1646,56 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
         )
 
     error_enabled = bool(config.get("error_analysis", True))
-    error_n_slices = int(config.get("error_n_slices", config.get("n_error_slices", 10)))
-    error_min_pairs = int(config.get("error_min_pairs_per_slice", 1))
-    slice_std: dict[str, np.ndarray] = {}
-    n_error_slices_used = 0
-    if error_enabled and error_n_slices >= 2 and len(idx0) >= 2:
-        slice_std, n_error_slices_used = estimate_slice_rate_std(
-            q=q,
-            weights=weights,
-            state=state,
-            idx0=idx0,
-            idx1=idx1,
-            n_states=n_states,
-            pairs=pairs,
-            thresholds=thresholds,
-            tau=tau,
-            divide_by_tau=bool(config.get("divide_by_tau", True)),
-            eps=float(config.get("flux_eps", 0.02)),
-            surface=str(config.get("flux_surface", "qi_decrease")),
-            chunk_size=int(config.get("chunk_size", 20000)),
-            weighted_flux=bool(config.get("weighted_flux", True)),
-            weighted_hits=bool(config.get("weighted_hits", config.get("weighted_flux", True))),
-            labeled_exits_only=bool(config.get("labeled_exits_only", False)),
-            pi_mode=str(config.get("pi_mode", "labels")),
-            time_unit=time_unit,
-            n_slices=error_n_slices,
-            min_pairs=error_min_pairs,
-            device=flux_device,
-            dtype=flux_dtype,
-        )
+    error_estimator = _resolve_error_estimator(config)
+    error_n_slices = int(config.get("error_n_blocks", config.get("error_n_slices", config.get("n_error_slices", 10))))
+    error_min_pairs = int(config.get("error_min_pairs_per_block", config.get("error_min_pairs_per_slice", 1)))
+    resampled_std: dict[str, np.ndarray] = {}
+    n_error_blocks_used = 0
+    if error_enabled and error_estimator != "direct" and error_n_slices >= 2 and len(idx0) >= 2:
+        common_error_kwargs = {
+            "q": q,
+            "weights": weights,
+            "state": state,
+            "idx0": idx0,
+            "idx1": idx1,
+            "n_states": n_states,
+            "pairs": pairs,
+            "thresholds": thresholds,
+            "tau": tau,
+            "divide_by_tau": bool(config.get("divide_by_tau", True)),
+            "eps": float(config.get("flux_eps", 0.02)),
+            "surface": str(config.get("flux_surface", "qi_decrease")),
+            "chunk_size": int(config.get("chunk_size", 20000)),
+            "weighted_flux": bool(config.get("weighted_flux", True)),
+            "weighted_hits": bool(config.get("weighted_hits", config.get("weighted_flux", True))),
+            "labeled_exits_only": bool(config.get("labeled_exits_only", False)),
+            "pi_mode": str(config.get("pi_mode", "labels")),
+            "time_unit": time_unit,
+            "min_pairs": error_min_pairs,
+            "device": flux_device,
+            "dtype": flux_dtype,
+            "kinetic_edge_filter": kinetic_edge_filter_cfg,
+        }
+        if error_estimator == "block_jackknife":
+            resampled_std, n_error_blocks_used = estimate_block_jackknife_rate_std(
+                **common_error_kwargs,
+                n_blocks=error_n_slices,
+            )
+        else:
+            resampled_std, n_error_blocks_used = estimate_slice_rate_std(
+                **common_error_kwargs,
+                n_slices=error_n_slices,
+            )
 
-    pi_std = _combine_std(pi_direct_std, slice_std.get("pi"))
-    T_hit_std = _combine_std(T_hit_direct_std, slice_std.get("T_hit"))
-    exit_counts_std = _combine_std(exit_counts_direct_std, slice_std.get("exit_counts"))
-    exit_weight_std = _combine_std(exit_weight_direct_std, slice_std.get("exit_weight"))
-    J_thresholds_std = _combine_std(J_thresholds_direct_std, slice_std.get("J_thresholds"))
-    J_matrix_std = _combine_std(J_matrix_direct_std, slice_std.get("J_matrix"))
-    C_matrix_std = _combine_std(C_matrix_direct_std, slice_std.get("C_matrix"))
-    C_abs_matrix_std = _combine_std(C_abs_matrix_direct_std, slice_std.get("C_abs_matrix"))
-    k_direct_std = _combine_std(k_direct_direct_std, slice_std.get("k_direct"))
+    pi_std = _pick_std(pi_direct_std, resampled_std.get("pi"), error_estimator)
+    T_hit_std = _pick_std(T_hit_direct_std, resampled_std.get("T_hit"), error_estimator)
+    exit_counts_std = _pick_std(exit_counts_direct_std, resampled_std.get("exit_counts"), error_estimator)
+    exit_weight_std = _pick_std(exit_weight_direct_std, resampled_std.get("exit_weight"), error_estimator)
+    J_thresholds_std = _pick_std(J_thresholds_direct_std, resampled_std.get("J_thresholds"), error_estimator)
+    J_matrix_std = _pick_std(J_matrix_direct_std, resampled_std.get("J_matrix"), error_estimator)
+    C_matrix_std = _pick_std(C_matrix_direct_std, resampled_std.get("C_matrix"), error_estimator)
+    C_abs_matrix_std = _pick_std(C_abs_matrix_direct_std, resampled_std.get("C_abs_matrix"), error_estimator)
+    k_direct_std = _pick_std(k_direct_direct_std, resampled_std.get("k_direct"), error_estimator)
     assert pi_std is not None
     assert T_hit_std is not None
     assert exit_counts_std is not None
@@ -1394,11 +1705,46 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
     assert C_matrix_std is not None
     assert C_abs_matrix_std is not None
     assert k_direct_std is not None
+    k_direct_std_unfiltered = k_direct_std.copy()
+
+    K_unfiltered = assemble_generator(
+        k_direct_unfiltered,
+        negative_policy=str(config.get("negative_rate_policy", "clip")),
+        negative_tol=float(config.get("negative_rate_tolerance", 0.0)),
+    )
+    P_jump_unfiltered = compute_jump_probabilities(K_unfiltered)
+    k_direct, kinetic_edge_removed_mask, kinetic_edge_filter_stats = filter_kinetic_edges(
+        k_direct_unfiltered,
+        P_jump_unfiltered,
+        k_direct_std=k_direct_std_unfiltered,
+        config={"kinetic_edge_filter": kinetic_edge_filter_cfg},
+    )
+    if kinetic_edge_filter_stats["n_removed_edges"] > 0:
+        print(
+            "[RATE] Removed "
+            f"{kinetic_edge_filter_stats['n_removed_edges']} low-probability kinetic edge(s) "
+            "before generator/MFPT calculations."
+        )
+    k_direct_std = k_direct_std_unfiltered.copy()
+    k_direct_std[kinetic_edge_removed_mask] = 0.0
+    K = assemble_generator(
+        k_direct,
+        negative_policy=str(config.get("negative_rate_policy", "clip")),
+        negative_tol=float(config.get("negative_rate_tolerance", 0.0)),
+    )
+    P_jump = compute_jump_probabilities(K)
+    mfpt = compute_mfpt_matrix(K)
+    k_mfpt = compute_mfpt_rate_matrix(mfpt)
+    for row_idx, (i, j) in enumerate(pairs):
+        table.loc[row_idx, "k_direct_ij"] = float(k_direct[i, j])
+        table.loc[row_idx, "k_ij"] = float(k_direct[i, j])
+    table = add_mfpt_rates_to_table(table, pairs, k_mfpt)
+
     propagated_std = propagate_rate_matrix_std(k_direct, k_direct_std)
-    K_std = _combine_std(propagated_std["K"], slice_std.get("K"))
-    P_jump_std = _combine_std(propagated_std["P_jump"], slice_std.get("P_jump"))
-    MFPT_std = _combine_std(propagated_std["MFPT"], slice_std.get("MFPT"))
-    k_mfpt_std = _combine_std(propagated_std["k_mfpt"], slice_std.get("k_mfpt"))
+    K_std = _pick_std(propagated_std["K"], resampled_std.get("K"), error_estimator)
+    P_jump_std = _pick_std(propagated_std["P_jump"], resampled_std.get("P_jump"), error_estimator)
+    MFPT_std = _pick_std(propagated_std["MFPT"], resampled_std.get("MFPT"), error_estimator)
+    k_mfpt_std = _pick_std(propagated_std["k_mfpt"], resampled_std.get("k_mfpt"), error_estimator)
     assert K_std is not None
     assert P_jump_std is not None
     assert MFPT_std is not None
@@ -1412,8 +1758,11 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
     np.save(os.path.join(out_dir, "C_matrix.npy"), C_matrix)
     np.save(os.path.join(out_dir, "C_abs_matrix.npy"), C_abs_matrix)
     np.save(os.path.join(out_dir, "k_direct_raw.npy"), k_direct_raw)
+    np.save(os.path.join(out_dir, "k_direct_unfiltered.npy"), k_direct_unfiltered)
     np.save(os.path.join(out_dir, "k_direct.npy"), k_direct)
     np.save(os.path.join(out_dir, "k_matrix.npy"), k_direct)
+    np.save(os.path.join(out_dir, "K_unfiltered.npy"), K_unfiltered)
+    np.save(os.path.join(out_dir, "P_jump_unfiltered.npy"), P_jump_unfiltered)
     np.save(os.path.join(out_dir, "K.npy"), K)
     np.save(os.path.join(out_dir, "P_jump.npy"), P_jump)
     np.save(os.path.join(out_dir, "MFPT.npy"), mfpt)
@@ -1424,8 +1773,10 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
     np.save(os.path.join(out_dir, "J_matrix_std.npy"), J_matrix_std)
     np.save(os.path.join(out_dir, "C_matrix_std.npy"), C_matrix_std)
     np.save(os.path.join(out_dir, "C_abs_matrix_std.npy"), C_abs_matrix_std)
+    np.save(os.path.join(out_dir, "k_direct_std_unfiltered.npy"), k_direct_std_unfiltered)
     np.save(os.path.join(out_dir, "k_direct_std.npy"), k_direct_std)
     np.save(os.path.join(out_dir, "k_matrix_std.npy"), k_direct_std)
+    np.save(os.path.join(out_dir, "kinetic_edge_removed_mask.npy"), kinetic_edge_removed_mask.astype(np.int8))
     np.save(os.path.join(out_dir, "K_std.npy"), K_std)
     np.save(os.path.join(out_dir, "P_jump_std.npy"), P_jump_std)
     np.save(os.path.join(out_dir, "MFPT_std.npy"), MFPT_std)
@@ -1451,12 +1802,17 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
     write_matrix_csv(os.path.join(out_dir, "C_abs_matrix.csv"), C_abs_matrix)
     write_matrix_csv(os.path.join(out_dir, "C_abs_matrix_std.csv"), C_abs_matrix_std)
     write_matrix_csv(os.path.join(out_dir, "k_direct_raw.csv"), k_direct_raw)
+    write_matrix_csv(os.path.join(out_dir, "k_direct_unfiltered.csv"), k_direct_unfiltered)
     write_matrix_csv(os.path.join(out_dir, "k_direct.csv"), k_direct)
+    write_matrix_csv(os.path.join(out_dir, "k_direct_std_unfiltered.csv"), k_direct_std_unfiltered)
     write_matrix_csv(os.path.join(out_dir, "k_direct_std.csv"), k_direct_std)
     write_matrix_csv(os.path.join(out_dir, "k_matrix.csv"), k_direct)
     write_matrix_csv(os.path.join(out_dir, "k_matrix_std.csv"), k_direct_std)
+    write_matrix_csv(os.path.join(out_dir, "kinetic_edge_removed_mask.csv"), kinetic_edge_removed_mask.astype(np.float64))
+    write_matrix_csv(os.path.join(out_dir, "K_unfiltered.csv"), K_unfiltered)
     write_matrix_csv(os.path.join(out_dir, "K.csv"), K)
     write_matrix_csv(os.path.join(out_dir, "K_std.csv"), K_std)
+    write_matrix_csv(os.path.join(out_dir, "P_jump_unfiltered.csv"), P_jump_unfiltered)
     write_matrix_csv(os.path.join(out_dir, "P_jump.csv"), P_jump)
     write_matrix_csv(os.path.join(out_dir, "P_jump_std.csv"), P_jump_std)
     write_matrix_csv(os.path.join(out_dir, "MFPT.csv"), mfpt)
@@ -1503,23 +1859,29 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
         "model_input": model_input_summary,
         "probability_checks": checks,
         "rate_sanitize": rate_sanitize,
+        "kinetic_edge_filter": kinetic_edge_filter_stats,
         "n_lagged_pairs": int(len(idx0)),
         "zero_weight_mask": zero_weight_mask_stats,
         "error_analysis": {
             "enabled": bool(error_enabled),
-            "method": "weighted/counting standard errors plus lagged-pair slice standard deviations",
-            "requested_slices": int(error_n_slices),
-            "used_slices": int(n_error_slices_used),
-            "min_pairs_per_slice": int(error_min_pairs),
+            "method": str(error_estimator),
+            "include_threshold_variance_in_error": bool(config.get("include_threshold_variance_in_error", False)),
+            "requested_blocks": int(error_n_slices),
+            "used_blocks": int(n_error_blocks_used),
+            "min_pairs_per_block": int(error_min_pairs),
         },
         "rate_outputs": {
             "T_hit": os.path.abspath(os.path.join(out_dir, "T_hit.npy")),
             "k_direct_raw": os.path.abspath(os.path.join(out_dir, "k_direct_raw.npy")),
+            "k_direct_unfiltered": os.path.abspath(os.path.join(out_dir, "k_direct_unfiltered.npy")),
             "k_direct": os.path.abspath(os.path.join(out_dir, "k_direct.npy")),
+            "K_unfiltered": os.path.abspath(os.path.join(out_dir, "K_unfiltered.npy")),
+            "P_jump_unfiltered": os.path.abspath(os.path.join(out_dir, "P_jump_unfiltered.npy")),
             "K": os.path.abspath(os.path.join(out_dir, "K.npy")),
             "P_jump": os.path.abspath(os.path.join(out_dir, "P_jump.npy")),
             "MFPT": os.path.abspath(os.path.join(out_dir, "MFPT.npy")),
             "k_mfpt": os.path.abspath(os.path.join(out_dir, "k_mfpt.npy")),
+            "kinetic_edge_removed_mask_csv": os.path.abspath(os.path.join(out_dir, "kinetic_edge_removed_mask.csv")),
             "k_direct_std_csv": os.path.abspath(os.path.join(out_dir, "k_direct_std.csv")),
             "P_jump_std_csv": os.path.abspath(os.path.join(out_dir, "P_jump_std.csv")),
             "MFPT_std_csv": os.path.abspath(os.path.join(out_dir, "MFPT_std.csv")),

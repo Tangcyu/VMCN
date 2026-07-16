@@ -28,7 +28,17 @@ TENSORQ_LABEL:
     tol_window: 5
     avg_last: 20
     seed: 2026
-  labeling_method: "kmeans"
+  labeling_method: "trajectory_anchors"
+  trajectory_anchors:
+    states:
+      - label: 0
+        name: "A"
+        dcd_folder: "PATH/TO/unbiased_state_A"
+        match: "stateA_"
+      - label: 1
+        name: "B"
+        dcd_folder: "PATH/TO/unbiased_state_B"
+        match: "stateB_"
   cluster_space: "features"
   standardize_features: true
   pca_cluster_dim: 20
@@ -102,8 +112,15 @@ NEXT_HIT_RATE:
   n_thresholds: 9
   flux_eps: 0.02
   divide_by_tau: true
+  kinetic_edge_filter:
+    enabled: false
+    min_jump_probability: 1.0e-3
+    min_rate_zscore: 1.0
+    preserve_connectivity: true
   error_analysis: true
-  error_n_slices: 10
+  error_estimator: "block_jackknife"
+  error_n_blocks: 10
+  include_threshold_variance_in_error: false
 
 PAIRWISE_COMMITTOR:
   dataset_path: "./dataset_out/dataset.pt"

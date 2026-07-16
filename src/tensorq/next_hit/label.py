@@ -284,20 +284,97 @@ def find_dcd_files(folder: str, match_prefix: str) -> list[str]:
     return files
 
 
+def _as_path_list(value: Any, key: str) -> list[str]:
+    if isinstance(value, (str, os.PathLike)):
+        return [str(value)]
+    if isinstance(value, list) and all(isinstance(item, (str, os.PathLike)) for item in value):
+        return [str(item) for item in value]
+    raise ValueError(f"{key} must be a path string or a list of path strings.")
+
+
+def dcd_files_from_spec(spec: dict[str, Any], default_folder: str | None = None, default_match: str | None = None) -> list[str]:
+    if "dcd_files" in spec:
+        files = _as_path_list(spec["dcd_files"], "dcd_files")
+    elif "dcd_file" in spec:
+        files = _as_path_list(spec["dcd_file"], "dcd_file")
+    else:
+        folder = spec.get("dcd_folder", spec.get("folder", default_folder))
+        match_prefix = spec.get("match", spec.get("match_prefix", default_match))
+        if folder is None or match_prefix is None:
+            raise ValueError("Trajectory specs must define dcd_files/dcd_file or dcd_folder and match.")
+        files = find_dcd_files(str(folder), str(match_prefix))
+    missing = [path for path in files if not os.path.exists(path)]
+    if missing:
+        raise FileNotFoundError(f"DCD files do not exist: {missing}")
+    return files
+
+
+def process_trajectory_jobs(
+    jobs: list[tuple[int, str, str, str, int, bool, bool, int, str]],
+    workers: int,
+    desc: str = "Processing trajectories",
+) -> list[TrajectoryBlock]:
+    if workers < 0:
+        raise ValueError("trajectory_workers must be >= 0.")
+    if not jobs:
+        return []
+
+    blocks: list[TrajectoryBlock] = []
+    actual_workers = min(max(1, workers), len(jobs))
+    if actual_workers > 1:
+        print(f"[IO] Loading trajectories with {actual_workers} worker threads.")
+        with ThreadPoolExecutor(max_workers=actual_workers) as executor:
+            future_to_path = {executor.submit(load_trajectory_block, *job): job[1] for job in jobs}
+            for future in tqdm(as_completed(future_to_path), total=len(future_to_path), desc=desc):
+                try:
+                    block = future.result()
+                except Exception as exc:
+                    raise RuntimeError(f"Failed while processing {future_to_path[future]}") from exc
+                if block is not None:
+                    blocks.append(block)
+        blocks.sort(key=lambda block: block.traj_idx)
+    else:
+        for job in tqdm(jobs, desc=desc):
+            block = load_trajectory_block(*job)
+            if block is not None:
+                blocks.append(block)
+    return blocks
+
+
+def pack_trajectory_blocks(
+    blocks: list[TrajectoryBlock],
+    use_internal_features: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str], list[int], list[str]]:
+    if not blocks:
+        raise RuntimeError("No usable DCD/.colvars.traj pairs were loaded.")
+
+    headers = blocks[0].headers
+    for block in blocks[1:]:
+        if block.headers != headers:
+            raise ValueError("Colvars headers differ across trajectories.")
+
+    colvars_all = np.vstack([block.colvars for block in blocks]).astype(np.float32)
+    features_all = (
+        np.vstack([block.features for block in blocks if block.features is not None]).astype(np.float32)
+        if use_internal_features
+        else np.zeros((colvars_all.shape[0], 0), dtype=np.float32)
+    )
+    traj_id = np.concatenate([np.full(block.n_frames, block.traj_idx, dtype=np.int64) for block in blocks])
+    frame_counts = [block.n_frames for block in blocks]
+    sources = [os.path.abspath(block.dcd_path) for block in blocks]
+    return features_all, colvars_all, traj_id, headers, frame_counts, sources
+
+
 def load_trajectory_blocks(config: dict[str, Any], use_internal_features: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str], list[int], list[str]]:
     topology_file = config["topology_file"]
-    dcd_folder = config["dcd_folder"]
-    match_prefix = config["match"]
     selection = config.get("sel_weights", "protein and not name H*")
     every = int(config.get("every", 1))
     index_mismatch = bool(config.get("colvars_mismatch", True))
     feature_chunk_size = int(config.get("feature_chunk_size", 250))
     distance_backend = str(config.get("distance_backend", "serial"))
     workers = int(config.get("trajectory_workers", config.get("num_workers", 1)))
-    if workers < 0:
-        raise ValueError("trajectory_workers must be >= 0.")
 
-    dcd_files = find_dcd_files(dcd_folder, match_prefix)
+    dcd_files = dcd_files_from_spec(config)
     jobs = [
         (
             traj_idx,
@@ -313,46 +390,111 @@ def load_trajectory_blocks(config: dict[str, Any], use_internal_features: bool) 
         for traj_idx, dcd_path in enumerate(dcd_files)
     ]
 
-    blocks: list[TrajectoryBlock] = []
-    actual_workers = min(max(1, workers), len(jobs))
-    if actual_workers > 1:
-        print(f"[IO] Loading trajectories with {actual_workers} worker threads.")
-        with ThreadPoolExecutor(max_workers=actual_workers) as executor:
-            future_to_path = {executor.submit(load_trajectory_block, *job): job[1] for job in jobs}
-            for future in tqdm(as_completed(future_to_path), total=len(future_to_path), desc="Processing trajectories"):
-                try:
-                    block = future.result()
-                except Exception as exc:
-                    raise RuntimeError(f"Failed while processing {future_to_path[future]}") from exc
-                if block is not None:
-                    blocks.append(block)
-        blocks.sort(key=lambda block: block.traj_idx)
+    blocks = process_trajectory_jobs(jobs, workers, desc="Processing trajectories")
+    return pack_trajectory_blocks(blocks, use_internal_features)
+
+
+def is_trajectory_anchor_method(config: dict[str, Any]) -> bool:
+    return str(config.get("labeling_method", "kmeans")).lower() in {"trajectory_anchors", "unbiased_anchors"}
+
+
+def parse_trajectory_anchor_states(config: dict[str, Any]) -> list[dict[str, Any]]:
+    anchor_cfg = config.get("trajectory_anchors", config.get("unbiased_anchors", None))
+    if anchor_cfg is None:
+        raise ValueError("trajectory_anchors labeling requires a trajectory_anchors section.")
+    if isinstance(anchor_cfg, dict):
+        states = anchor_cfg.get("states", anchor_cfg.get("anchors", None))
     else:
-        for job in tqdm(jobs, desc="Processing trajectories"):
-            block = load_trajectory_block(*job)
-            if block is not None:
-                blocks.append(block)
+        states = anchor_cfg
+    if not isinstance(states, list) or not states:
+        raise ValueError("trajectory_anchors.states must be a non-empty list.")
 
-    if not blocks:
-        raise RuntimeError("No usable DCD/.colvars.traj pairs were loaded.")
+    parsed: list[dict[str, Any]] = []
+    for idx, state in enumerate(states):
+        if not isinstance(state, dict):
+            raise ValueError(f"trajectory_anchors state #{idx} must be a mapping.")
+        label = int(state.get("label", idx))
+        if label < 0:
+            raise ValueError(f"trajectory_anchors state #{idx} label must be non-negative.")
+        parsed.append({**state, "label": label, "name": state.get("name", f"state_{label}")})
 
-    headers = blocks[0].headers
-    for block in blocks[1:]:
-        if block.headers != headers:
-            raise ValueError("Colvars headers differ across trajectories.")
+    labels = sorted({int(state["label"]) for state in parsed})
+    expected = list(range(len(labels)))
+    if labels != expected:
+        raise ValueError(f"Anchor labels must be contiguous 0..k-1; got {labels}, expected {expected}.")
+    return parsed
 
-    colvars_all = np.vstack([block.colvars for block in blocks]).astype(np.float32)
-    features_all = (
-        np.vstack([block.features for block in blocks if block.features is not None]).astype(np.float32)
-        if use_internal_features
-        else np.zeros((colvars_all.shape[0], 0), dtype=np.float32)
+
+def load_trajectory_anchor_blocks(
+    config: dict[str, Any],
+    use_internal_features: bool,
+    start_traj_idx: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str], list[int], list[str], np.ndarray, list[dict[str, Any]]]:
+    states = parse_trajectory_anchor_states(config)
+    topology_file = config["topology_file"]
+    selection = config.get("sel_weights", "protein and not name H*")
+    default_every = int(config.get("every", 1))
+    default_index_mismatch = bool(config.get("colvars_mismatch", True))
+    default_feature_chunk_size = int(config.get("feature_chunk_size", 250))
+    default_distance_backend = str(config.get("distance_backend", "serial"))
+    default_folder = config.get("dcd_folder", None)
+    workers = int(config.get("trajectory_workers", config.get("num_workers", 1)))
+
+    jobs = []
+    job_labels: dict[int, int] = {}
+    job_state_index: dict[int, int] = {}
+    traj_idx = int(start_traj_idx)
+    for state_idx, state in enumerate(states):
+        dcd_files = dcd_files_from_spec(state, default_folder=default_folder, default_match=None)
+        for dcd_path in dcd_files:
+            jobs.append(
+                (
+                    traj_idx,
+                    dcd_path,
+                    str(state.get("topology_file", topology_file)),
+                    str(state.get("sel_weights", selection)),
+                    int(state.get("every", default_every)),
+                    bool(state.get("colvars_mismatch", default_index_mismatch)),
+                    use_internal_features,
+                    int(state.get("feature_chunk_size", default_feature_chunk_size)),
+                    str(state.get("distance_backend", default_distance_backend)),
+                )
+            )
+            job_labels[traj_idx] = int(state["label"])
+            job_state_index[traj_idx] = int(state_idx)
+            traj_idx += 1
+
+    blocks = process_trajectory_jobs(jobs, workers, desc="Processing anchor trajectories")
+    features, colvars, traj_id, headers, frame_counts, sources = pack_trajectory_blocks(blocks, use_internal_features)
+    labels = np.concatenate(
+        [np.full(block.n_frames, job_labels[block.traj_idx], dtype=np.int64) for block in blocks]
     )
-    traj_id = np.concatenate(
-        [np.full(block.n_frames, block.traj_idx, dtype=np.int64) for block in blocks]
-    )
-    frame_counts = [block.n_frames for block in blocks]
-    sources = [os.path.abspath(block.dcd_path) for block in blocks]
-    return features_all, colvars_all, traj_id, headers, frame_counts, sources
+    records = [
+        {
+            "label": int(job_labels[block.traj_idx]),
+            "name": str(states[job_state_index[block.traj_idx]]["name"]),
+            "traj_id": int(block.traj_idx),
+            "n_frames": int(block.n_frames),
+            "source": os.path.abspath(block.dcd_path),
+        }
+        for block in blocks
+    ]
+    return features, colvars, traj_id, headers, frame_counts, sources, labels, records
+
+
+def anchor_labels_from_records(
+    records: list[dict[str, Any]],
+    traj_id: np.ndarray | None,
+    n_frames: int,
+) -> np.ndarray:
+    if traj_id is None:
+        raise ValueError("trajectory_anchors relabeling requires traj_id in the dataset.")
+    labels = np.full(int(n_frames), -1, dtype=np.int64)
+    for record in records:
+        if "traj_id" not in record or "label" not in record:
+            continue
+        labels[np.asarray(traj_id, dtype=np.int64) == int(record["traj_id"])] = int(record["label"])
+    return labels
 
 
 def build_clustering_matrix(
@@ -956,8 +1098,58 @@ def label_metastates(
     cv_headers: list[str],
     elbow_png: str | None = None,
     centroid_plot_prefix: str | None = None,
+    preset_labels: np.ndarray | None = None,
+    anchor_records: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     method = str(config.get("labeling_method", "kmeans")).lower()
+    if method in {"trajectory_anchors", "unbiased_anchors"}:
+        if preset_labels is None:
+            raise ValueError("trajectory_anchors labeling requires preset anchor labels.")
+        meta_state = np.asarray(preset_labels, dtype=np.int64).reshape(-1)
+        if meta_state.shape != (features.shape[0],):
+            raise ValueError(
+                f"preset anchor labels must have shape ({features.shape[0]},); got {meta_state.shape}."
+            )
+        labeled = meta_state >= 0
+        if not np.any(labeled):
+            raise ValueError("trajectory_anchors labeling did not label any frames.")
+        labels = sorted(int(label) for label in np.unique(meta_state[labeled]))
+        expected = list(range(len(labels)))
+        if labels != expected:
+            raise ValueError(f"Anchor labels must be contiguous 0..k-1; got {labels}, expected {expected}.")
+        n_states = len(labels)
+        dist = np.full(meta_state.shape[0], np.inf, dtype=np.float32)
+        dist[labeled] = 0.0
+        thresholds = np.ones(n_states, dtype=np.float32)
+        records = list(anchor_records or [])
+        report_metastate_sizes(meta_state, n_states)
+        return {
+            "labeling_method": method,
+            "meta_state": meta_state,
+            "dist_to_centroid": dist,
+            "thresholds": thresholds,
+            "n_states": n_states,
+            "details": {
+                "mode": "all frames from anchor trajectories are labeled; other frames remain -1",
+                "anchors": records,
+                "anchor_traj_ids_by_label": {
+                    int(label): [
+                        int(record["traj_id"])
+                        for record in records
+                        if int(record.get("label", -1)) == int(label)
+                    ]
+                    for label in labels
+                },
+                "counts": {
+                    int(label): int(np.sum(meta_state == int(label)))
+                    for label in labels
+                },
+                "n_intermediate": int(np.sum(meta_state == -1)),
+            },
+            "cluster_space": None,
+            "elbow": None,
+            "centroid_plot": None,
+        }
     if method == "user_defined_basins":
         if cv_data is None:
             raise ValueError("user_defined_basins requires CV data.")
@@ -1026,7 +1218,7 @@ def label_metastates(
             ),
         }
     if method != "kmeans":
-        raise ValueError("labeling_method must be 'kmeans' or 'user_defined_basins'.")
+        raise ValueError("labeling_method must be 'kmeans', 'user_defined_basins', or 'trajectory_anchors'.")
 
     cluster_space = str(config.get("cluster_space", "features")).lower()
     X_cluster = build_clustering_matrix(
@@ -1202,9 +1394,47 @@ def build_from_trajectories(config: dict[str, Any]) -> dict[str, Any]:
 
     riteweight_space = str(config.get("riteweight_space", "features")).lower()
     cluster_space = str(config.get("cluster_space", "features")).lower()
-    use_internal = riteweight_space == "features" or cluster_space in {"features", "pca_highdim"}
+    use_internal = riteweight_space == "features" or (
+        not is_trajectory_anchor_method(config) and cluster_space in {"features", "pca_highdim"}
+    )
 
     features_raw, colvars_all, traj_id, headers, frame_counts, sources = load_trajectory_blocks(config, use_internal)
+    preset_labels = None
+    anchor_records = None
+    if is_trajectory_anchor_method(config):
+        base_n_frames = int(colvars_all.shape[0])
+        anchor_data = load_trajectory_anchor_blocks(
+            config,
+            use_internal_features=use_internal,
+            start_traj_idx=int(np.max(traj_id)) + 1 if traj_id.size else 0,
+        )
+        (
+            anchor_features_raw,
+            anchor_colvars,
+            anchor_traj_id,
+            anchor_headers,
+            anchor_frame_counts,
+            anchor_sources,
+            anchor_labels,
+            anchor_records,
+        ) = anchor_data
+        if anchor_headers != headers:
+            raise ValueError("Colvars headers differ between primary and anchor trajectories.")
+        features_raw = np.vstack([features_raw, anchor_features_raw]).astype(np.float32)
+        colvars_all = np.vstack([colvars_all, anchor_colvars]).astype(np.float32)
+        traj_id = np.concatenate([traj_id, anchor_traj_id]).astype(np.int64)
+        frame_counts = frame_counts + anchor_frame_counts
+        sources = sources + anchor_sources
+        preset_labels = np.concatenate(
+            [
+                np.full(base_n_frames, -1, dtype=np.int64),
+                anchor_labels.astype(np.int64),
+            ]
+        )
+        print(
+            f"[ANCHORS] Loaded {len(anchor_records)} anchor trajectories "
+            f"({int(anchor_labels.size)} frames) for trajectory_anchors labeling."
+        )
     cv_data, cv_headers = prepare_cv_matrix(
         colvars_all,
         headers,
@@ -1258,6 +1488,8 @@ def build_from_trajectories(config: dict[str, Any]) -> dict[str, Any]:
         cv_headers,
         elbow_png=elbow_png,
         centroid_plot_prefix=centroid_plot_prefix,
+        preset_labels=preset_labels,
+        anchor_records=anchor_records,
     )
     meta_state = label_result["meta_state"]
     dist_to_centroid = label_result["dist_to_centroid"]
@@ -1326,6 +1558,17 @@ def relabel_existing_dataset(config: dict[str, Any]) -> dict[str, Any]:
     out_dir = ensure_dir(config.get("output_dir", os.path.dirname(dataset_path) or "."))
     elbow_png = os.path.join(out_dir, "elbow_kmeans.png") if bool(config.get("write_diag_plots", True)) else None
     centroid_plot_prefix = os.path.join(out_dir, "kmeans_centroids")
+    relabel_traj_id = pack.traj_id.numpy().astype(np.int64) if pack.traj_id is not None else None
+    preset_labels = None
+    anchor_records = None
+    if is_trajectory_anchor_method(config):
+        anchor_records = list(pack.meta.get("label_details", {}).get("anchors", []))
+        if not anchor_records:
+            raise ValueError(
+                "--relabel-only with trajectory_anchors requires anchor records in dataset metadata. "
+                "Build the dataset with trajectory_anchors first."
+            )
+        preset_labels = anchor_labels_from_records(anchor_records, relabel_traj_id, features.shape[0])
     result = label_metastates(
         config,
         features,
@@ -1333,6 +1576,8 @@ def relabel_existing_dataset(config: dict[str, Any]) -> dict[str, Any]:
         cv_headers,
         elbow_png=elbow_png,
         centroid_plot_prefix=centroid_plot_prefix,
+        preset_labels=preset_labels,
+        anchor_records=anchor_records,
     )
     meta = dict(pack.meta)
     meta.update(
@@ -1358,7 +1603,7 @@ def relabel_existing_dataset(config: dict[str, Any]) -> dict[str, Any]:
         result["thresholds"],
         meta,
         cv_data,
-        pack.traj_id.numpy().astype(np.int64) if pack.traj_id is not None else None,
+        relabel_traj_id,
     )
     if bool(config.get("save_cv", True)):
         save_weights_csv(
@@ -1368,7 +1613,7 @@ def relabel_existing_dataset(config: dict[str, Any]) -> dict[str, Any]:
             pack.weights.numpy().astype(np.float32),
             result["meta_state"],
             result["dist_to_centroid"],
-            pack.traj_id.numpy().astype(np.int64) if pack.traj_id is not None else None,
+            relabel_traj_id,
         )
     print(f"[RELABEL] Updated dataset labels in: {dataset_path}")
     return {"dataset_path": os.path.abspath(dataset_path), "n_states": int(result["n_states"])}

@@ -1,0 +1,188 @@
+project:
+  out_dir: ./msmcv_out
+  seed: 2026
+  force: false
+  # Use cuda, cuda:0, cuda:7, cpu, or auto. CUDA is used by torch k-means.
+  device: cuda
+
+data:
+  # CV columns kept in the frame table for weights, inspection, and projection plots.
+  cvs: ["ACH_1", "ACH_2", "coplanar_1", "Cloop_A", "Cloop_D", "theta"]
+
+  # Coordinates used for weighted clustering, MSM construction, PCCA, and
+  # default core labeling. Use source: cvs for the table CV columns, or
+  # source: features for a RiteWeight feature cache such as features_internal_zmat.npz.
+  model:
+    source: cvs
+    # source: features
+    # path: /path/to/features_internal_zmat.npz
+    # A TensorQ label.py dataset also works:
+    # path: /path/to/dataset.pt
+    # key: features
+    # key: X
+    # Optional names for high-dimensional feature columns; default is feature_0...
+    # feature_columns: []
+    # Use "all", integer indices, or feature column names.
+    dimensions: all
+
+  # Option A: use old riteweight output directly.
+  # If a table has traj_id/frame_in_traj columns they are honored. Without those,
+  # each table is treated as one trajectory.
+  # TensorQ label.py .pt datasets are also supported here. The frame table uses
+  # the saved cv tensor by default, or features when meta.stored_feature_space is
+  # cv. For unusual files, set pt_table_key/tensor_key to a saved aligned 2D tensor.
+  # Headers are read from meta.cv_headers; otherwise set cv_columns explicitly.
+  # cv_columns: ["phi1", "phi2", "phi3"]
+  # pt_table_key: cv
+  tables:
+    - /home/ctang/1.Ongoing/1.Diffusion.Additional/5.Pen_Channel/5.NewCVs/rw_out/frame_weights.csv
+  #  - /path/to/dataset.pt
+
+  # Option B: read raw colvars trajectories while keeping each file separate.
+  colvars: []
+  #   - path: /path/to/shooting_0001.colvars.traj
+  #     traj_id: shooting_0001
+
+  # Option C: recursively discover colvars files.
+  folders: []
+  match_colvars: "*.colvars.traj"
+  tag_regex: "(.+)"
+
+  stride: 1
+  discard_before_step: null
+  step_column: step
+  weight_column: weight
+  # For concatenated tables without traj_id, infer separate trajectories before lag pairing.
+  # step_reset splits whenever step decreases. Alternatively set frames_per_traj.
+  infer_trajectories:
+    enabled: true
+    method: step_reset
+    step_column: step
+    # frames_per_traj: 10000
+
+normalization:
+  # standard, robust, range, none
+  method: standard
+  eps: 1.0e-8
+
+clustering:
+  n_microstates: 400
+  max_iter: 100
+  batch_size: 65536
+  device: cuda
+  # Use data.weight_column for weighted k-means center updates. Zero-weight frames
+  # are still assigned to the nearest microstate but do not move cluster centers.
+  use_weights: true
+
+msm:
+  # In frames after data.stride.
+  lags: [5, 10, 20, 50, 100, 150, 200]
+  n_timescales: 12
+  # Use origin-frame statistical weights, e.g. from riteweight.py frame_weights.csv.
+  use_weights: true
+  # Frames with weight==0 may appear as z(t+tau) targets but never as z(t) origins.
+  # When zero-weight frames exist, reversible symmetrization is disabled to preserve this directionality.
+  mask_zero_weight_origins: true
+  reversible: true
+  pseudocount: 1.0e-8
+
+pcca:
+  # Choose this after inspecting implied_timescales.png/csv.
+  selected_lag: 50
+  m_values: [2, 3, 4, 5, 6, 7, 8]
+  # Optional: run/test exactly one m without editing m_values.
+  # single_m: 4
+  # Do not use microstates supported only by weight==0 frames when selecting macrostates.
+  exclude_zero_weight_microstates: true
+  # Uses deeptime PCCA+ if installed; otherwise uses a spectral clustering fallback.
+  use_deeptime: true
+
+ck_test:
+  multiples: [1, 2, 3, 4, 5]
+
+spectral_analysis:
+  enabled: true
+  # m is estimated as number_of_slow_processes + 1 from active-MSM eigengaps.
+  selected_lag: 50
+  n_eigenvalues: 12
+  max_processes: 8
+
+core_labeling:
+  enabled: true
+  # Optional: recompute only core labels/datasets while reusing upstream stages.
+  # force: false
+  # After PCCA, estimate a weighted kNN FES inside each macrostate.
+  # The macrostate center is the sampled point with lowest FES/highest density.
+  # top_density keeps all low-FES candidates; density_connected keeps only connected pockets.
+  selection_mode: density_connected
+  core_fraction: 0.05
+  # count = top fraction of frames per macrostate; weight = top cumulative weighted mass.
+  core_by: count
+  k_neighbors: 25
+  density_reference_points: 5000
+  density_batch_size: 4096
+  # auto/cuda/torch uses CUDA when torch can see a GPU; numpy forces CPU.
+  density_backend: auto
+  device: auto
+  connected_core:
+    graph_k_neighbors: 10
+    # If null, edge cutoff = edge_distance_scale * quantile(kdist, edge_distance_quantile).
+    max_edge_distance: null
+    edge_distance_scale: 2.5
+    edge_distance_quantile: 0.90
+    min_pocket_size: 10
+    # false: keep only the connected component around the lowest-FES center.
+    # true: split disconnected low-FES pockets into separate core labels.
+    split_disconnected_pockets: false
+    max_pockets_per_macrostate: null
+  # model: use data.model coordinates; cvs: use feature_cvs below; features:
+  # use core_labeling.features, falling back to data.model settings.
+  feature_source: model
+  feature_cvs: ["ACH_1", "ACH_2", "coplanar_1", "Cloop_A", "Cloop_D", "theta"]
+  # features:
+  #   path: /path/to/features_internal_zmat.npz
+  #   key: X
+  #   dimensions: all
+  # By default the saved TensorQ dataset uses the same coordinates as core
+  # labeling. Use this to label in CV space but save all training features.
+  # output_features:
+  #   source: features
+  #   path: /path/to/features_internal_zmat.npz
+  #   key: X
+  #   dimensions: all
+  standardize: true
+  # TensorQ-compatible dataset fields: features, weights, meta_state, dist_to_centroid,
+  # thresholds, cv, traj_id, meta_yaml/meta.
+  save_format: npz
+
+core_structures:
+  enabled: false
+  # Standalone structure export. Run with:
+  #   PYTHONPATH=src python -m tensorq.MSMlabel.cli structures config.yaml
+  # This does not rerun data/clustering/MSM/PCCA/core labeling.
+  dataset_path: ./msmcv_out/06_core_labels/lag_50/m_4/dataset.pt
+  top: /path/to/topology.psf
+  folders:
+    - /path/to/original/trajectory/root
+  match_dcd: "Unbias_noh.1*"
+  match_colvars: "Unbias_noh.1*"
+  tag_regex: "([AB])"
+  match_cvs: ["ACH_1", "ACH_2", "coplanar_1", "Cloop_A", "Cloop_D", "theta"]
+  # CV match tolerance for comparing dataset.pt rows to colvars rows.
+  tolerance: 1.0e-4
+  # Stride used by RiteWeight when it created the dataset/frame table.
+  stride: 1
+  allow_skip_first_colvars: true
+  # Relative paths are resolved under project.out_dir.
+  out_dir: 07_core_structures
+  chunk_size: 256
+  # Optional mdtraj atom selection for smaller outputs.
+  # atomselect: "protein"
+
+plotting:
+  # Omit cv_pairs to plot every unique pair from data.cvs.
+  cv_pairs:
+    - ["ACH_1", "ACH_2"]
+    - ["ACH_1", "coplanar_1"]
+    - ["ACH_2", "theta"]
+  max_points: 200000

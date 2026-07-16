@@ -9,14 +9,33 @@ import numpy as np
 
 from ..common.config import ensure_dir, load_yaml, select_section, setup_device, write_yaml
 from .config_utils import _relabel_cfg, _sample_indices, _select_graph_features, _standardize_features
-from .density import _knn_missing_components, _select_weighted_density_core
-from .entropy import _classify_lagged_entropy_candidates, _remove_inconsistent_states
+from .density import (
+    _component_weights,
+    _knn_missing_components,
+    _select_weighted_density_core,
+    _weighted_local_density,
+)
+from .entropy import _classify_lagged_entropy_candidates, _positive_lag_list, _remove_inconsistent_states
+from .kinetic_groups import (
+    _choose_microstate_count,
+    _feature_macro_assignments,
+    _fit_microstates,
+    _format_eigenvalues,
+    _macro_assignments,
+    _macro_transition_rows,
+    _renumber_by_population,
+    _renumber_frame_labels_by_population,
+    _sorted_eigensystem,
+    _suggest_group_count,
+    _transition_matrix,
+)
 from .kinetics import (
     _iteratively_merge_kinetically_duplicate_labels,
     _iteratively_merge_mixed_new_labels,
     _reshape_existing_basins_from_kinetic_groups,
     _split_labels_by_final_knn_kinetics,
 )
+from .lag_pair_utils import build_lag_pairs
 from .utils import _entropy_confidence, _save_dataset_like_input
 from .visualization import plot_relabel_diagnostics
 from .settings import analysis_settings
@@ -58,6 +77,396 @@ def _relabel_diagnostics(config, graph_idx, masks, tables, lagged_entropy_classi
             relabel_cfg.get("promote_missing_metastate_candidates", True)
         ),
     }
+
+
+def _candidate_kinetic_config(config, relabel_cfg):
+    settings = analysis_settings(config)
+
+    def cfg_value(key, fallback):
+        value = relabel_cfg.get(key, fallback)
+        return fallback if value is None else value
+
+    return {
+        "min_microstates": int(cfg_value("candidate_kinetic_min_microstates", 6)),
+        "max_microstates": int(cfg_value("candidate_kinetic_max_microstates", 50)),
+        "target_frames_per_microstate": int(
+            cfg_value("candidate_kinetic_target_frames_per_microstate", 200)
+        ),
+        "min_frames_per_microstate": int(
+            cfg_value("candidate_kinetic_min_frames_per_microstate", 20)
+        ),
+        "max_core_frames": int(
+            cfg_value(
+                "candidate_kinetic_max_core_frames",
+                relabel_cfg.get("max_graph_frames", 20000),
+            )
+        ),
+        "microstate_batch_size": int(cfg_value("candidate_kinetic_microstate_batch_size", 8192)),
+        "microstate_n_init": int(cfg_value("candidate_kinetic_microstate_n_init", 2)),
+        "macrostate_n_init": int(cfg_value("candidate_kinetic_macrostate_n_init", 5)),
+        "min_macro_groups": int(cfg_value("candidate_kinetic_min_macro_groups", 1)),
+        "max_macro_groups": int(
+            cfg_value(
+                "candidate_kinetic_max_macro_groups",
+                min(6, settings["max_groups"]),
+            )
+        ),
+        "min_slow_eigenvalue": float(
+            cfg_value(
+                "candidate_kinetic_min_slow_eigenvalue",
+                settings["min_slow_eigenvalue"],
+            )
+        ),
+        "min_eigengap": float(
+            cfg_value("candidate_kinetic_min_eigengap", settings["eigengap"])
+        ),
+        "strong_eigengap": float(cfg_value("candidate_kinetic_strong_eigengap", 0.12)),
+        "split_on_slow_mode_without_eigengap": bool(
+            cfg_value("candidate_kinetic_split_on_slow_mode_without_eigengap", True)
+        ),
+    }
+
+
+def _candidate_cluster_core(z, candidate_idx, weights, cfg):
+    candidate_idx = np.asarray(candidate_idx, dtype=np.int64)
+    if candidate_idx.size == 0:
+        return candidate_idx, 0, {
+            "density_k_neighbors": 0,
+            "density_radius_power": np.nan,
+            "knn_backend": "none",
+            "knn_device": "",
+        }
+
+    min_size = int(cfg.get("min_new_core_size", 100))
+    fraction = float(cfg.get("candidate_cluster_core_fraction", 1.0))
+    fraction = min(max(fraction, 1.0 / max(1, candidate_idx.size)), 1.0)
+    if candidate_idx.size <= min_size or fraction >= 1.0:
+        return candidate_idx, 0, {
+            "density_k_neighbors": 0,
+            "density_radius_power": np.nan,
+            "knn_backend": "none",
+            "knn_device": "",
+        }
+
+    density, density_meta = _weighted_local_density(z, candidate_idx, weights, cfg)
+    sample_weights = _component_weights(candidate_idx, weights)
+    order = np.lexsort((candidate_idx, -density))
+    if np.sum(sample_weights) > 0.0:
+        cumulative = np.cumsum(sample_weights[order])
+        target = fraction * float(np.sum(sample_weights))
+        keep_count = int(np.searchsorted(cumulative, target, side="left") + 1)
+    else:
+        keep_count = int(np.ceil(fraction * candidate_idx.size))
+    keep_count = min(max(keep_count, min_size), candidate_idx.size)
+    cluster_idx = np.sort(candidate_idx[order[:keep_count]])
+    return cluster_idx, int(candidate_idx.size - cluster_idx.size), density_meta
+
+
+def _candidate_core_space(relabel_cfg):
+    mode = str(relabel_cfg.get("candidate_core_space", "slow")).lower()
+    if mode in {"slow", "slow_dof", "slow_dofs", "slow_embedding", "kinetic"}:
+        return "slow"
+    if mode in {"graph", "features", "feature", "model_features", "cv", "cvs"}:
+        return "graph"
+    raise ValueError("relabel.candidate_core_space must be 'slow' or 'graph'.")
+
+
+def _slow_microstate_embedding(eigenvalues, eigenvectors, n_groups, kg_cfg, relabel_cfg):
+    available = max(0, int(eigenvectors.shape[1]) - 1)
+    if available <= 0:
+        return None, 0
+
+    max_dims_raw = relabel_cfg.get("candidate_slow_core_max_dims", None)
+    max_dims = available if max_dims_raw is None else int(max_dims_raw)
+    max_dims = min(max(1, max_dims), available)
+
+    vals = np.clip(np.abs(np.real(eigenvalues)), 0.0, 1.0)
+    slow_min = float(kg_cfg.get("min_slow_eigenvalue", 0.80))
+    n_above = int(np.sum(vals[1:] >= slow_min))
+    needed_for_split = max(1, int(n_groups) - 1) if int(n_groups) > 1 else 1
+    n_dims = min(max(n_above, needed_for_split), max_dims)
+    if n_dims <= 0:
+        return None, 0
+
+    emb = np.asarray(eigenvectors[:, 1 : 1 + n_dims], dtype=np.float64)
+    return _standardize_features(emb), int(n_dims)
+
+
+def _select_slow_density_core(
+    frame_idx,
+    slow_frame_coords,
+    weights,
+    relabel_cfg,
+):
+    local_idx = np.arange(frame_idx.size, dtype=np.int64)
+    local_weights = None if weights is None else np.asarray(weights, dtype=np.float64)[frame_idx]
+    core_local, shell_local, density_meta = _select_weighted_density_core(
+        slow_frame_coords,
+        local_idx,
+        local_weights,
+        relabel_cfg,
+    )
+    core_idx = np.sort(frame_idx[core_local])
+    shell_idx = np.sort(frame_idx[shell_local])
+    return core_idx, shell_idx, density_meta
+
+
+def _kinetic_missing_components(
+    z,
+    candidate_idx,
+    q_values,
+    q_max,
+    q_argmax,
+    entropy_norm,
+    weights,
+    config,
+    trajectory_index,
+    frame_index,
+):
+    relabel_cfg = _relabel_cfg(config)
+    if not bool(relabel_cfg.get("candidate_kinetic_clustering_enabled", True)):
+        return _knn_missing_components(z, candidate_idx, q_values, q_max, q_argmax, entropy_norm, weights, relabel_cfg)
+    if trajectory_index is None or frame_index is None:
+        return _knn_missing_components(z, candidate_idx, q_values, q_max, q_argmax, entropy_norm, weights, relabel_cfg)
+
+    settings = analysis_settings(config)
+    candidate_idx = np.asarray(candidate_idx, dtype=np.int64)
+    min_size = int(relabel_cfg.get("min_new_core_size", 100))
+    min_weight = float(relabel_cfg.get("min_new_core_weight", 0.0))
+    if candidate_idx.size < min_size:
+        return [], []
+
+    cluster_idx, cluster_shell_frames, density_meta = _candidate_cluster_core(
+        z,
+        candidate_idx,
+        weights,
+        relabel_cfg,
+    )
+    if cluster_idx.size < min_size:
+        return [], []
+
+    lag_list = _positive_lag_list(
+        relabel_cfg.get("candidate_kinetic_lag_list", relabel_cfg.get("candidate_lag_list", None)),
+        settings["lag_list"],
+    )
+    if not lag_list:
+        return _knn_missing_components(z, candidate_idx, q_values, q_max, q_argmax, entropy_norm, weights, relabel_cfg)
+
+    lag_pairs = build_lag_pairs(trajectory_index, frame_index, lag_list)
+    analysis_lag_raw = relabel_cfg.get("candidate_kinetic_analysis_lag", None)
+    analysis_lag = int(lag_list[-1] if analysis_lag_raw is None else analysis_lag_raw)
+    if analysis_lag not in lag_pairs:
+        analysis_lag = int(lag_list[-1])
+
+    kg_cfg = _candidate_kinetic_config(config, relabel_cfg)
+    n_micro = _choose_microstate_count(cluster_idx.size, kg_cfg)
+    min_pairs = int(relabel_cfg.get("candidate_kinetic_min_valid_pairs", settings["min_count"]))
+    if n_micro < 2:
+        return _knn_missing_components(z, candidate_idx, q_values, q_max, q_argmax, entropy_norm, weights, relabel_cfg)
+
+    random_seed = int(relabel_cfg.get("random_seed", settings["random_seed"]))
+    micro_labels_core, sampled = _fit_microstates(
+        z,
+        cluster_idx,
+        n_micro,
+        kg_cfg,
+        random_seed=random_seed,
+    )
+    micro_by_frame = np.full(q_values.shape[0], -1, dtype=np.int64)
+    micro_by_frame[cluster_idx] = micro_labels_core
+    micro_counts = np.bincount(micro_labels_core, minlength=n_micro).astype(np.int64, copy=False)
+
+    transition, _, _, n_transition_pairs = _transition_matrix(
+        micro_by_frame,
+        lag_pairs,
+        analysis_lag,
+        n_micro,
+        weights=weights,
+        max_pairs=int(relabel_cfg.get("candidate_kinetic_max_transition_pairs", 0)),
+        random_seed=random_seed + int(analysis_lag),
+    )
+    if n_transition_pairs < min_pairs:
+        if bool(relabel_cfg.get("candidate_kinetic_fallback_to_knn", True)):
+            return _knn_missing_components(z, candidate_idx, q_values, q_max, q_argmax, entropy_norm, weights, relabel_cfg)
+        return [], []
+
+    eigenvalues, eigenvectors = _sorted_eigensystem(transition)
+    forced_groups = relabel_cfg.get("candidate_kinetic_n_groups", None)
+    if forced_groups is None:
+        n_groups, eigengap_score, split_confidence = _suggest_group_count(eigenvalues, n_micro, kg_cfg)
+    else:
+        n_groups = max(1, min(int(forced_groups), int(kg_cfg["max_macro_groups"]), n_micro))
+        eigengap_score = np.nan
+        split_confidence = "forced"
+
+    macro_by_micro = _macro_assignments(eigenvectors, n_groups, random_seed, kg_cfg)
+    macro_by_micro = _renumber_by_population(macro_by_micro, micro_counts)
+    macro_labels_core = macro_by_micro[micro_labels_core]
+    if n_groups > 1 and np.unique(macro_labels_core).size < n_groups:
+        macro_labels_core = _feature_macro_assignments(z, cluster_idx, n_groups, random_seed, kg_cfg)
+        macro_labels_core = _renumber_frame_labels_by_population(macro_labels_core)
+        split_confidence = f"{split_confidence}_feature_fallback"
+
+    n_groups_observed = int(np.unique(macro_labels_core).size)
+    if n_groups_observed < 1:
+        return [], []
+
+    core_space = _candidate_core_space(relabel_cfg)
+    slow_micro_embedding, slow_embedding_dims = _slow_microstate_embedding(
+        eigenvalues,
+        eigenvectors,
+        n_groups_observed,
+        kg_cfg,
+        relabel_cfg,
+    )
+    if core_space == "slow" and slow_micro_embedding is None:
+        core_space = "graph"
+    slow_frame_embedding = (
+        slow_micro_embedding[micro_labels_core]
+        if core_space == "slow" and slow_micro_embedding is not None
+        else None
+    )
+
+    macro_by_frame = np.full(q_values.shape[0], -1, dtype=np.int64)
+    macro_by_frame[cluster_idx] = macro_labels_core
+    macro_matrices, macro_counts = _macro_transition_rows(
+        macro_by_frame,
+        lag_pairs,
+        lag_list,
+        n_groups_observed,
+        weights=weights,
+        max_pairs=int(relabel_cfg.get("candidate_kinetic_max_transition_pairs", 0)),
+        random_seed=random_seed,
+    )
+
+    rows = []
+    assignments = []
+    sample_weights = _component_weights(cluster_idx, weights)
+    total_weight = float(np.sum(sample_weights)) if sample_weights.size else float(cluster_idx.size)
+    for local_group in range(n_groups_observed):
+        group_local = np.flatnonzero(macro_labels_core == local_group)
+        candidate_frame_idx = cluster_idx[group_local]
+        candidate_weighted_population = (
+            float(np.sum(weights[candidate_frame_idx]))
+            if weights is not None
+            else float(candidate_frame_idx.size)
+        )
+        if candidate_frame_idx.size < min_size or candidate_weighted_population < min_weight:
+            continue
+
+        if core_space == "slow" and slow_frame_embedding is not None:
+            frame_idx, slow_shell_idx, core_density_meta = _select_slow_density_core(
+                candidate_frame_idx,
+                slow_frame_embedding[group_local],
+                weights,
+                relabel_cfg,
+            )
+            component_core_space = "slow_embedding"
+            preselected_density_core = True
+        else:
+            frame_idx = candidate_frame_idx
+            slow_shell_idx = np.zeros(0, dtype=np.int64)
+            core_density_meta = {
+                "density_k_neighbors": 0,
+                "density_radius_power": np.nan,
+                "density_reason": "candidate core kept in graph space for final density selection",
+            }
+            component_core_space = "graph"
+            preselected_density_core = False
+
+        weighted_population = float(np.sum(weights[frame_idx])) if weights is not None else float(frame_idx.size)
+        if frame_idx.size < min_size or weighted_population < min_weight:
+            continue
+
+        argmax = q_argmax[frame_idx]
+        if argmax.size:
+            states, counts = np.unique(argmax, return_counts=True)
+            dominant_pos = int(np.argmax(counts))
+            dominant_state = int(states[dominant_pos])
+            dominant_fraction = float(counts[dominant_pos] / argmax.size)
+            mean_q_dominant = float(np.mean(q_values[frame_idx, dominant_state]))
+        else:
+            dominant_state = -1
+            dominant_fraction = np.nan
+            mean_q_dominant = np.nan
+
+        row = {
+            "component": int(local_group),
+            "component_type": "kinetic_missing_metastate",
+            "state_a": -1,
+            "state_b": -1,
+            "n_frames": int(frame_idx.size),
+            "weighted_population": weighted_population,
+            "weighted_fraction_of_candidate_core": (
+                float(weighted_population / total_weight) if total_weight > 0.0 else np.nan
+            ),
+            "component_candidate_frames_before_core": int(candidate_frame_idx.size),
+            "component_candidate_weight_before_core": candidate_weighted_population,
+            "component_core_space": component_core_space,
+            "component_slow_embedding_dims": int(slow_embedding_dims if component_core_space == "slow_embedding" else 0),
+            "component_slow_core_shell_frames": int(slow_shell_idx.size),
+            "dominant_q_argmax": dominant_state,
+            "fraction_dominant_q_argmax": dominant_fraction,
+            "mean_q_dominant_argmax": mean_q_dominant,
+            "mean_q_max": float(np.mean(q_max[frame_idx])) if frame_idx.size else np.nan,
+            "mean_entropy_norm": float(np.mean(entropy_norm[frame_idx])) if frame_idx.size else np.nan,
+            "candidate_clustering_method": "kinetic_spectral",
+            "candidate_cluster_core_fraction": float(
+                relabel_cfg.get("candidate_cluster_core_fraction", 1.0)
+            ),
+            "candidate_cluster_core_frames": int(cluster_idx.size),
+            "candidate_cluster_shell_frames": int(cluster_shell_frames),
+            "candidate_kinetic_lag_list": lag_list,
+            "candidate_kinetic_analysis_lag": int(analysis_lag),
+            "candidate_kinetic_microstates": int(n_micro),
+            "candidate_kinetic_groups": int(n_groups_observed),
+            "candidate_kinetic_suggested_groups": int(n_groups),
+            "candidate_kinetic_split_confidence": split_confidence,
+            "candidate_kinetic_eigengap_score": float(eigengap_score),
+            "candidate_kinetic_eigenvalues": _format_eigenvalues(eigenvalues),
+            "candidate_kinetic_transition_pairs": int(n_transition_pairs),
+            "candidate_kinetic_microstate_fit_sampled": bool(sampled),
+            "candidate_graph_mode": "kinetic_spectral",
+            "preselected_density_core": preselected_density_core,
+            "knn_backend": "kinetic_spectral",
+            "knn_device": "",
+            "candidate_density_k_neighbors": int(
+                core_density_meta.get(
+                    "density_k_neighbors",
+                    density_meta.get("density_k_neighbors", 0),
+                )
+            ),
+            "candidate_density_radius_power": float(
+                core_density_meta.get(
+                    "density_radius_power",
+                    density_meta.get("density_radius_power", np.nan),
+                )
+            ),
+            "candidate_cluster_density_k_neighbors": int(density_meta.get("density_k_neighbors", 0)),
+            "candidate_cluster_density_radius_power": float(density_meta.get("density_radius_power", np.nan)),
+        }
+        for lag in lag_list:
+            probs = macro_matrices[int(lag)]
+            counts = macro_counts[int(lag)]
+            row[f"n_pairs_lag_{lag}"] = int(np.sum(counts[local_group]))
+            row[f"retention_lag_{lag}"] = (
+                float(probs[local_group, local_group])
+                if np.isfinite(probs[local_group, local_group])
+                else np.nan
+            )
+            for other in range(n_groups_observed):
+                if other != local_group:
+                    row[f"p_to_group_{other}_lag_{lag}"] = (
+                        float(probs[local_group, other])
+                        if np.isfinite(probs[local_group, other])
+                        else np.nan
+                    )
+        rows.append(row)
+        assignments.append(frame_idx)
+
+    if not rows and bool(relabel_cfg.get("candidate_kinetic_fallback_to_knn", True)):
+        return _knn_missing_components(z, candidate_idx, q_values, q_max, q_argmax, entropy_norm, weights, relabel_cfg)
+    return rows, assignments
 
 
 def propose_relabeling(
@@ -175,7 +584,7 @@ def propose_relabeling(
     component_rows = []
     component_frames = []
     if graph_idx.size:
-        component_rows, component_frames = _knn_missing_components(
+        component_rows, component_frames = _kinetic_missing_components(
             z,
             graph_idx,
             q_values,
@@ -183,9 +592,11 @@ def propose_relabeling(
             q_argmax,
             entropy_norm,
             weights,
-            relabel_cfg,
+            config,
+            trajectory_arr,
+            frame_arr,
         )
-    mark("density_knn_missing_components")
+    mark("candidate_component_clustering")
 
     next_label = int(np.max(state_labels[state_labels >= 0]) + 1) if np.any(state_labels >= 0) else 0
     new_core_mask = np.zeros(n_frames, dtype=bool)
@@ -303,6 +714,11 @@ def propose_relabeling(
     mark("kinetics_reshape_existing_basins")
 
     original_label_set = set(int(label) for label in np.unique(state_labels[state_labels >= 0]))
+    protected_split_labels = {
+        int(row["assigned_state"])
+        for row in reshaped_basin_groups
+        if row.get("action") == "split_to_new_label" and int(row.get("assigned_state", -1)) >= 0
+    }
     new_state, final_kinetic_merge_rows = _iteratively_merge_kinetically_duplicate_labels(
         new_state,
         original_label_set,
@@ -310,27 +726,42 @@ def propose_relabeling(
         frame_arr,
         weights,
         config,
+        protected_new_labels=protected_split_labels,
     )
     for row in final_kinetic_merge_rows:
         row["phase"] = "before_final_split"
     mark("kinetics_final_merge_before_split")
 
     next_label = int(np.max(new_state[new_state >= 0]) + 1) if np.any(new_state >= 0) else int(next_label)
-    (
-        new_state,
-        final_kinetic_split_rows,
-        final_kinetic_split_mask,
-        next_label,
-    ) = _split_labels_by_final_knn_kinetics(
-        new_state,
-        z,
-        original_label_set,
-        trajectory_arr,
-        frame_arr,
-        weights,
-        config,
-        next_label,
+    skip_final_split_after_candidate_kinetics = (
+        bool(relabel_cfg.get("candidate_kinetic_clustering_enabled", True))
+        and not bool(relabel_cfg.get("candidate_kinetic_allow_final_split", False))
     )
+    if skip_final_split_after_candidate_kinetics:
+        final_kinetic_split_rows = []
+        final_kinetic_split_mask = np.zeros_like(new_state, dtype=bool)
+    else:
+        (
+            new_state,
+            final_kinetic_split_rows,
+            final_kinetic_split_mask,
+            next_label,
+        ) = _split_labels_by_final_knn_kinetics(
+            new_state,
+            z,
+            original_label_set,
+            trajectory_arr,
+            frame_arr,
+            weights,
+            config,
+            next_label,
+        )
+        protected_split_labels.update(
+            int(row["assigned_label"])
+            for row in final_kinetic_split_rows
+            if row.get("action") == "split_component_to_new_label"
+            and int(row.get("assigned_label", -1)) >= 0
+        )
     mark("kinetics_final_knn_split")
 
     new_state, final_post_split_merge_rows = _iteratively_merge_kinetically_duplicate_labels(
@@ -340,6 +771,7 @@ def propose_relabeling(
         frame_arr,
         weights,
         config,
+        protected_new_labels=protected_split_labels,
     )
     for row in final_post_split_merge_rows:
         row["phase"] = "after_final_split"
