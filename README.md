@@ -11,7 +11,7 @@ TensorQ now uses one shared package architecture:
 
 The shared dataset is produced by `scripts/label.py` from the `TENSORQ_LABEL` config section. Both committor families consume that same `.pt` or `.npz` dataset.
 
-## Staged MSM-to-committor-vector workflow
+## Staged workflow (MSM/PCCA guess labels, committor vector, pathways, and relabeling)
 
 `run.py` is the single dispatcher for the four-stage workflow. The default
 `config.yaml` points to one focused configuration file per stage:
@@ -53,7 +53,7 @@ normalized Gini impurity `G = 1 - sum_j q_j^2` through the existing
 lag-safe kinetic checks, and threshold sections, while writing to separate
 output directories.
 
-## Commands
+<!-- ## Old Commands
 
 ## For generating datasets:
 ```bash
@@ -87,6 +87,6 @@ python scripts/pairwise_rate.py --config configs/example.yaml
 ## MSM/PCCA+ core labels
 ```bash
 PYTHONPATH=src python -m tensorq.MSMlabel.cli all src/tensorq/MSMlabel/config.template.yaml
-```
+``` -->
 
-For inference, plotting, and rate estimation, prefer `*_checkpoint.pt` models because they preserve the model input metadata.
+<!-- For inference, plotting, and rate estimation, prefer `*_checkpoint.pt` models because they preserve the model input metadata. -->
