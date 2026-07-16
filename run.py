@@ -121,14 +121,14 @@ def run_msm_core_label(raw: dict[str, Any]) -> None:
 
 
 def run_committor_vector(raw: dict[str, Any], requested: str | None = None) -> None:
-    from tensorq.next_hit.fit_rate import run as fit_rate
+
     from tensorq.next_hit.infer import run_inference
     from tensorq.next_hit.plot import run as plot
     from tensorq.next_hit.rate_constant import run as rate_constant
     from tensorq.next_hit.train import train_next_hit_committor
 
     substeps = [requested] if requested else _configured_substeps(
-        raw, ("train", "infer", "plot", "rate_constant", "fit_rate")
+        raw, ("train", "infer", "plot", "rate_constant")
     )
     actions = {
         "train": ("NEXT_HIT_COMMITTOR", "NEXT_HIT_TRAIN", "TRAIN", train_next_hit_committor),
@@ -136,14 +136,13 @@ def run_committor_vector(raw: dict[str, Any], requested: str | None = None) -> N
         "plot": ("NEXT_HIT_PLOT", "PLOT", plot),
         "rate": ("NEXT_HIT_RATE", "RATE_CONSTANT", rate_constant),
         "rate_constant": ("NEXT_HIT_RATE", "RATE_CONSTANT", rate_constant),
-        "fit_rate": ("NEXT_HIT_FIT_RATE", "FIT_RATE", "NEXT_HIT_RATE", fit_rate),
     }
     for name in substeps:
         normalized = name.replace("rateconstant", "rate_constant")
         if normalized not in actions:
             raise ValueError(
                 f"Unknown committor-vector substep {name!r}; use train, infer, plot, "
-                "rate_constant, or fit_rate."
+                "or rate_constant."
             )
         *section_names, function = actions[normalized]
         config = _section(raw, *section_names)

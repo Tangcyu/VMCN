@@ -2,8 +2,7 @@
 # q_j(x) is the probability that x next reaches state j.
 
 pipeline:
-  # fit_rate is optional and requires the rate output from rate_constant.
-  substeps: [train, infer, plot, rate_constant, fit_rate]
+  substeps: [train, infer, plot, rate_constant]
 
 NEXT_HIT_COMMITTOR:
   dataset_path: ./msmcv_out/06_core_labels/lag_50/m_4/dataset.pt
@@ -66,13 +65,3 @@ NEXT_HIT_RATE:
   error_analysis: true
   error_estimator: block_jackknife
   error_n_blocks: 10
-
-NEXT_HIT_FIT_RATE:
-  dataset: ./msmcv_out/06_core_labels/lag_50/m_4/dataset.pt
-  model: ./next_hit_train/next_hit_committor_best_checkpoint.pt
-  out_dir: ./next_hit_fit_rate
-  device: cuda:0
-  lag: 1
-  lag_reference: original_frames
-  rate_dir: ./next_hit_rate
-  fit_init: flux
