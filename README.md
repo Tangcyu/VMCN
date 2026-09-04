@@ -1,13 +1,14 @@
-# TensorQ
+# Variational Multistate Committor Network (VMCN)
 
-TensorQ now uses one shared package architecture:
+Variational Multistate Committor Network (VMCN) uses one shared package
+architecture:
 
 - `tensorq.common`: YAML, dataset, CV featurization, lagged indexing, and rate helpers.
 - `tensorq.next_hit`: next-hit committor training, inference, plotting, and rate estimation.
 - `tensorq.pairwise`: pair-wise committor training, inference, plotting, and rate estimation.
 - `tensorq.gradpath`: direct-channel gradient pathway shooting, weighted clustering, and plotting.
 - `tensorq.voronoi_merge`: Voronoi shared-segment alignment and iterative KLD diagnostics.
-- `tensorq.MSMlabel`: MSM/PCCA+ macrostate discovery and TensorQ core-label dataset export.
+- `tensorq.MSMlabel`: MSM/PCCA+ macrostate discovery and VMCN core-label dataset export.
 
 The staged workflow creates its shared `.pt` or `.npz` dataset during MSM core
 labeling (step 0). For the alternative trajectory-labeling workflow, the
@@ -16,7 +17,7 @@ maintained wrapper is `scripts/dataset_label.py` (installed as
 
 ## Environment and dependencies
 
-TensorQ requires Python 3.10 or newer; Python 3.12 is used for current
+VMCN requires Python 3.10 or newer; Python 3.12 is used for current
 development checks. Create an isolated environment and install the project
 from this repository:
 
@@ -114,7 +115,7 @@ python run.py --step 0
 
 This stage calls the same complete `all` pipeline as
 `tensorq.MSMlabel.cli`. It converts weighted trajectory/frame tables into a
-TensorQ core-label dataset.
+VMCN core-label dataset.
 
 1. `data` — loads tables, raw colvars, or discovered colvars trajectories;
    preserves trajectory boundaries; applies stride and weight handling; and
@@ -128,7 +129,7 @@ TensorQ core-label dataset.
    `pcca.m_values` or `pcca.single_m`, and evaluates macrostate transition and
    CK statistics.
 5. `core` — estimates density/free-energy cores inside each macrostate and
-   writes TensorQ-compatible labels. Core frames receive `meta_state >= 0`;
+   writes VMCN-compatible labels. Core frames receive `meta_state >= 0`;
    intermediate frames receive `meta_state = -1`.
 
 The principal output is the dataset under
