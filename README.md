@@ -9,7 +9,47 @@ TensorQ now uses one shared package architecture:
 - `tensorq.voronoi_merge`: Voronoi shared-segment alignment and iterative KLD diagnostics.
 - `tensorq.MSMlabel`: MSM/PCCA+ macrostate discovery and TensorQ core-label dataset export.
 
-The shared dataset is produced by `scripts/label.py` from the `TENSORQ_LABEL` config section. Both committor families consume that same `.pt` or `.npz` dataset.
+The staged workflow creates its shared `.pt` or `.npz` dataset during MSM core
+labeling (step 0). For the alternative trajectory-labeling workflow, the
+maintained wrapper is `scripts/dataset_label.py` (installed as
+`tensorq-label`). Both committor families consume the same dataset format.
+
+## Environment and dependencies
+
+TensorQ requires Python 3.10 or newer; Python 3.12 is used for current
+development checks. Create an isolated environment and install the project
+from this repository:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e .
+```
+
+Core dependencies are declared in `pyproject.toml`: NumPy, pandas, PyYAML,
+SciPy, scikit-learn, Matplotlib, PyTorch, tqdm, and setuptools for the build.
+Install optional features only when they are needed:
+
+```bash
+python -m pip install -e ".[label]"       # MDAnalysis: DCD feature extraction
+python -m pip install -e ".[structures]"  # MDTraj: PDB/DCD structure export
+python -m pip install -e ".[pcca]"        # deeptime: PCCA+ (otherwise spectral fallback)
+python -m pip install -e ".[all,test]"    # all optional runtime features + pytest
+```
+
+The default configs request CUDA where acceleration is useful. PyTorch is
+still required on CPU-only systems; the main training/inference runners fall
+back to CPU when CUDA is unavailable. For an NVIDIA GPU, install the PyTorch
+build matching the host driver/CUDA runtime before installing this project.
+Use `device: cpu`, `knn_backend: sklearn`, and `knn_device: cpu` explicitly
+when a reproducible CPU-only run is desired.
+
+Run the verification suite with:
+
+```bash
+python -m pytest -q
+```
 
 ## Staged workflow
 
@@ -21,6 +61,11 @@ The shared dataset is produced by `scripts/label.py` from the `TENSORQ_LABEL` co
 - `configs/2.Gradpath.yaml`: gradient pathfinding, weighted path clustering, plotting, and optional Voronoi merging.
 - `configs/3.Relabel.yaml`: diagnostics plus entropy (`H`) and Gini (`G`) relabeling.
 
+The committed stage YAML files are editable templates. Replace placeholder
+inputs such as `/path/to/frame_weights.csv` and confirm all dataset/model paths
+before starting a production run. Relative paths are resolved from the
+directory where the command is launched.
+
 Run from the repository root:
 
 ```bash
@@ -29,6 +74,23 @@ python run.py --step 1       # next-hit committor vector
 python run.py --step 2       # gradpath and Voronoi workflow
 python run.py --step 3       # diagnose, H relabel, G relabel
 ```
+
+The MSM/core-label stage can also be restarted at a specific substep:
+
+```bash
+python run.py --step 0 --substep data
+python run.py --step 0 --substep cluster
+python run.py --step 0 --substep msm
+python run.py --step 0 --substep pcca
+python run.py --step 0 --substep core
+python run.py --step 0 --substep structures
+```
+
+When a substep is selected, prerequisite artifacts are reused even if
+`project.force: true`; `force` applies only to the requested substep. Missing
+prerequisites are built automatically for `data` through `core`. The
+independent `structures` exporter requires an existing core-label dataset and
+a configured topology/trajectory; it does not rebuild the MSM stages.
 
 `--step` also accepts the names `msmcorelabel`, `committorvector`, `gradpath`,
 `relabel`, and `all`. Use a direct stage YAML when desired:
@@ -40,9 +102,9 @@ python run.py --step 2 --substep merging
 python run.py --step 3 --substep gini
 ```
 
-The sections below describe every dispatcher stage and substep. Substep names
-are the values accepted by `--substep` and by `pipeline.substeps` in each stage
-configuration.
+The sections below describe every dispatcher stage and substep. All names are
+accepted by `--substep`; stages 1–3 also read their default ordered lists from
+`pipeline.substeps` in the corresponding stage configuration.
 
 ### Step 0: MSM core labeling (`msmcorelabel`)
 
@@ -78,6 +140,14 @@ already-created core-label dataset:
 PYTHONPATH=src python -m tensorq.MSMlabel.cli structures configs/0.MSMcorelabel.yaml
 ```
 
+Configure `core_structures` before using that command. With `aligned_dcd`,
+dataset row `i` must correspond exactly to DCD frame `i`; the exporter writes
+the minimum-`dist_to_centroid` frame for each state as a PDB and can optionally
+write every labeled state to a separate DCD with `write_state_dcds: true`.
+Without `aligned_dcd`, it matches dataset CVs against the configured
+DCD/colvars pairs within `tolerance`. Both modes require the `structures`
+optional dependency.
+
 ### Step 1: next-hit committor vector (`committorvector`)
 
 ```bash
@@ -105,6 +175,12 @@ substeps use the corresponding `NEXT_HIT_*` sections in
    the trained next-hit model. Outputs are written under
    `NEXT_HIT_RATE.out_dir`, including `rate_constants.csv`, `K.npy`,
    `P_jump.npy`, and `MFPT.npy`.
+
+   For shooting trajectories started outside equilibrium, set
+   `NEXT_HIT_RATE.discard_first_n_frames: N`. The first `N` original saved
+   dataset frames of every trajectory are excluded from population, flux,
+   transition, rate, and MFPT estimates. The applied frame/pair counts are
+   recorded under `trajectory_burn_in` in the rate `summary.yaml`.
 
 There is intentionally no `rate_fit` or `fit_rate` substep in the committor
 vector workflow. Rate estimation ends with `rate_constant`.
@@ -137,7 +213,8 @@ between `GRADPATH` and `VORONOI_MERGE`.
    linkage data, weighted center paths, and medoid paths. The native gradpath
    runner performs this substep in the same call as `pathfinding`, so the
    dispatcher reports it as complete rather than running the expensive
-   shooting calculation twice.
+   shooting calculation twice. Requesting `clustering` by itself invokes that
+   bundled runner and therefore performs shooting as well.
 3. `plot` — optional plotting of saved pathways, dendrograms, selected channel
    points, and pathways colored by `q_i q_j`. It can be run separately with
    `python run.py --step 2 --substep plot`.
@@ -149,7 +226,10 @@ between `GRADPATH` and `VORONOI_MERGE`.
 For automatic multi-pair pathfinding, set `GRADPATH.automatic_pairs: true`
 and provide `GRADPATH.p_jump` (normally the `P_jump.csv` written by
 `rate_constant`). The dispatcher then processes every pair above
-`prob_threshold`, subject to `max_pairs`.
+`prob_threshold`, subject to `max_pairs`. In this mode the same threshold also
+removes pathway clusters with fewer than
+`ceil(prob_threshold * max_points)` generated paths; discarded paths receive
+cluster label 0 and the details are saved in the gradpath summary.
 
 ### Step 3: label diagnostics and relabeling (`relabel`)
 
@@ -187,40 +267,10 @@ The entropy and Gini runs share the thresholds, density settings, and
 lagged-kinetic settings in `RELABEL`, but write separate outputs so their
 label assignments can be compared safely.
 
-<!-- ## Old Commands
-
-## For generating datasets:
-```bash
-python scripts/label.py --config configs/example.yaml
-```
-## For training:
-```bash
-python scripts/next_hit_train.py --config configs/example.yaml
-```
-## Plotting and building kinetic models:
-```bash
-python scripts/next_hit_infer.py --config configs/example.yaml
-python scripts/next_hit_plot.py --config configs/example.yaml
-python scripts/next_hit_rate.py --config configs/example.yaml
-```
-
-## Path finding from committor vector gradient
-```bash
-python scripts/gradpath.py --config configs/gradpath.example.yaml
-python scripts/gradpath_plot.py --config configs/gradpath.example.yaml
-python scripts/gradpath.mergy.py --config configs/voronoi_merge.example.yaml # Merging based on Voronoi expansion
-```
-## Old pairwise committor related
-```bash
-python scripts/pairwise_train.py --config configs/example.yaml
-python scripts/pairwise_infer.py --config configs/example.yaml
-python scripts/pairwise_plot.py --config configs/example.yaml
-python scripts/pairwise_rate.py --config configs/example.yaml
-```
-
-## MSM/PCCA+ core labels
-```bash
-PYTHONPATH=src python -m tensorq.MSMlabel.cli all src/tensorq/MSMlabel/config.template.yaml
-``` -->
-
-<!-- For inference, plotting, and rate estimation, prefer `*_checkpoint.pt` models because they preserve the model input metadata. -->
+As an optional final operation in either relabeling run,
+`RELABEL.relabel.rate_merge_enabled: true` merges connected macrostates using
+the `P_jump.npy` and `MFPT.npy` written by step 1. A directed edge must satisfy
+both `P_ij > rate_merge_probability_cutoff` and
+`MFPT_ij < rate_merge_mfpt_cutoff_frames`; bidirectional qualification can be
+required. The groups, qualifying edges, and compacted label map are recorded
+in `relabel_summary.yaml`.

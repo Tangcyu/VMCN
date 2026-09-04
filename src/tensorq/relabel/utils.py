@@ -60,12 +60,24 @@ def _save_dataset_like_input(dataset_path, output_path, pack, new_state, config,
     }
 
     if out_ext in {".pt", ".pth"}:
+        try:
+            source = torch.load(dataset_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            source = torch.load(dataset_path, map_location="cpu")
         out = {
             "features": pack.features.detach().cpu().float(),
             "weights": pack.weights.detach().cpu().float(),
             "meta_state": torch.as_tensor(save_state, dtype=torch.long),
             "meta": meta,
         }
+        if isinstance(source, dict):
+            for key in ("format", "version"):
+                if key in source:
+                    out[key] = source[key]
+            if "fel_weights" in source:
+                out["fel_weights"] = torch.as_tensor(
+                    source["fel_weights"][:: int(stride)]
+                ).detach().cpu()
         if pack.cv is not None:
             out["cv"] = pack.cv.detach().cpu().float()
         if pack.traj_id is not None:

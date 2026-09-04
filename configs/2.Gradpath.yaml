@@ -38,6 +38,8 @@ GRADPATH:
 
   # Automatic multi-pair mode (uncomment and set automatic_pairs: true):
   # p_jump: ./next_hit_rate/P_jump.csv
+  # This cutoff selects state pairs and also drops pathway clusters containing
+  # fewer than ceil(prob_threshold * max_points) generated paths.
   # prob_threshold: 0.05
   # max_pairs: null
 

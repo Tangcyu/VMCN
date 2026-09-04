@@ -43,7 +43,8 @@ Relabeling is implemented in `relabel.py`. The proposal returned by
 - `diagnostics`
 - `scores`
 
-Automatic relabeling follows three stages.
+Automatic relabeling follows three structural/kinetic stages and an optional
+fourth rate-based macrostate merge.
 
 ### 1. Entropy
 
@@ -89,6 +90,31 @@ caches standardized features and same-state lag-pair positions, and
 `basin_kinetic_groups.max_transition_pairs_per_state_lag` can cap the number of
 transition pairs used per state and lag. A value of `0` keeps exact transition
 counts; a positive value uses a reproducible sampled estimate.
+
+### 4. Optional rate-based macrostate merge
+
+When `relabel.rate_merge_enabled` is true, `rate_merge.py` loads the next-hit
+`P_jump.npy` and `MFPT.npy` matrices. A directed edge qualifies only when the
+same direction satisfies both strict criteria:
+
+```text
+P_ij > rate_merge_probability_cutoff
+MFPT_ij < rate_merge_mfpt_cutoff_frames
+```
+
+With `rate_merge_require_bidirectional: true`, both directions must qualify.
+Connected qualifying macrostates are merged and labels are compacted. The
+summary records the groups, directed edges, MFPTs, and final label mapping.
+
+```yaml
+relabel:
+  rate_merge_enabled: true
+  rate_merge_probability_path: /path/to/P_jump.npy
+  rate_merge_mfpt_path: /path/to/MFPT.npy
+  rate_merge_probability_cutoff: 0.95
+  rate_merge_mfpt_cutoff_frames: 100
+  rate_merge_require_bidirectional: false
+```
 
 ## Outputs
 

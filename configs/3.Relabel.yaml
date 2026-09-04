@@ -74,6 +74,16 @@ RELABEL:
     torch_knn_query_batch: 4096
     torch_knn_reference_batch: 32768
 
+    # Optional final macrostate merge using rate_constant outputs. An edge
+    # qualifies only when one direction passes both strict cutoffs; set
+    # require_bidirectional to demand that both directions qualify.
+    rate_merge_enabled: false
+    rate_merge_probability_path: ./next_hit_rate/P_jump.npy
+    rate_merge_mfpt_path: ./next_hit_rate/MFPT.npy
+    rate_merge_probability_cutoff: 0.95
+    rate_merge_mfpt_cutoff_frames: 100
+    rate_merge_require_bidirectional: false
+
   basin_kinetic_groups:
     enabled: true
     lag_list: [1, 2, 5, 10, 20]

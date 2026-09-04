@@ -6,8 +6,8 @@
 #
 # Workflow:
 #   1. Build or relabel a shared dataset:
-#        python scripts/label.py --config configs/Full.yaml
-#        python scripts/label.py --config configs/Full.yaml --relabel-only
+#        python scripts/dataset_label.py --config configs/archive/Full.yaml
+#        python scripts/dataset_label.py --config configs/archive/Full.yaml --relabel-only
 #
 #   2. Train / infer / plot / estimate rates for next-hit committors:
 #        python scripts/next_hit_train.py --config configs/Full.yaml

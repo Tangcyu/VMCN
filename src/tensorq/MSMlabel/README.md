@@ -15,8 +15,9 @@ The workflow is checkpointed by stage:
 ## Quick Start
 
 ```bash
-cd /home/ctang/1.Ongoing/2.MSMtoCommittorvector/Tensorq.v.0.1
-PYTHONPATH=src python -m tensorq.MSMlabel.cli all ../5.nAChR/pen_channel_from_riteweight.yaml
+cd /path/to/VMCN.v.0.1
+python -m pip install -e .
+tensorq-msmlabel all /path/to/msm_config.yaml
 ```
 
 For a staged run:
@@ -26,6 +27,7 @@ PYTHONPATH=src python -m tensorq.MSMlabel.cli data config.template.yaml
 PYTHONPATH=src python -m tensorq.MSMlabel.cli cluster config.template.yaml
 PYTHONPATH=src python -m tensorq.MSMlabel.cli msm config.template.yaml
 PYTHONPATH=src python -m tensorq.MSMlabel.cli pcca config.template.yaml
+PYTHONPATH=src python -m tensorq.MSMlabel.cli core config.template.yaml
 PYTHONPATH=src python -m tensorq.MSMlabel.cli structures config.template.yaml
 ```
 
@@ -129,4 +131,17 @@ This follows the TensorQ next-hit dataset convention: `features`, `weights`, `me
 
 Set `core_structures.enabled: true` and run `PYTHONPATH=src python -m tensorq.MSMlabel.cli structures config.yaml` from the Tensorq repository root to export structures from an existing `dataset.pt` or `dataset.npz`. This stage does not rerun data preparation, clustering, MSM, PCCA, or core labeling.
 
-The exporter reconstructs the original RiteWeight DCD/colvars pairing using `folders`, `match_dcd`, `match_colvars`, `tag_regex`, `stride`, and `allow_skip_first_colvars`. It then matches rows whose `dataset.pt` CV values have `meta_state >= 0` to colvars rows within `core_structures.tolerance` over `core_structures.match_cvs`, and writes PDBs under `07_core_structures/core_state_*/`. `frames.csv`, `summary.csv`, and `counts.csv` record the mapping back to the source DCD frame. `mdtraj` is required only for this export step.
+There are two export modes:
+
+- Set `core_structures.aligned_dcd` when dataset row `i` is exactly DCD frame
+  `i`. The exporter writes one `core_state_NNN.pdb` at the minimum
+  `dist_to_centroid` frame per state. Set `write_state_dcds: true` to stream all
+  frames with `meta_state >= 0` into one DCD per state.
+- Otherwise, configure `folders`, `match_dcd`, `match_colvars`, `tag_regex`,
+  `stride`, and `allow_skip_first_colvars`. The exporter matches labeled
+  dataset CVs to colvars rows within `core_structures.tolerance` over
+  `core_structures.match_cvs`, then writes the center PDB for each state.
+
+`frames.csv`, `summary.csv`, and `counts.csv` record the source-frame mapping;
+aligned state-DCD export also writes `state_dcds.csv`. MDTraj is required only
+for this export step and is available through `pip install -e ".[structures]"`.

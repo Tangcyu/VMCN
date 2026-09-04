@@ -6,6 +6,7 @@ import re
 import struct
 import time
 from collections import defaultdict, deque
+from contextlib import ExitStack
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -649,6 +650,168 @@ def save_matched_pdbs(
     return pd.DataFrame(summary_rows)
 
 
+def save_aligned_core_pdbs(
+    *,
+    frame_table: pd.DataFrame,
+    out_dir: str,
+    top_path: str,
+    atomselect: Optional[str],
+) -> pd.DataFrame:
+    """Write core PDBs when dataset rows map directly to DCD frame indices."""
+
+    try:
+        import mdtraj as md
+    except Exception as exc:
+        raise SystemExit("Writing core structures requires mdtraj.") from exc
+
+    atom_indices = None
+    if atomselect:
+        topology = md.load_topology(top_path)
+        atom_indices = topology.select(str(atomselect))
+        if atom_indices.size == 0:
+            raise SystemExit(f"core_structures.atomselect selected zero atoms: {atomselect}")
+
+    rows: List[Dict[str, Any]] = []
+    for _, row in frame_table.sort_values("core_state").iterrows():
+        state = int(row["core_state"])
+        dcd_path = str(row["dcd"])
+        dcd_frame = int(row["dcd_frame"])
+        structure = md.load_frame(
+            dcd_path,
+            index=dcd_frame,
+            top=top_path,
+            atom_indices=atom_indices,
+        )
+        pdb_path = os.path.join(out_dir, f"core_state_{state:03d}.pdb")
+        structure.save_pdb(pdb_path)
+        rows.append(
+            {
+                "core_state": state,
+                "dataset_row": int(row["dataset_row"]),
+                "pdb": pdb_path,
+                "model_index": 1,
+                "dcd": dcd_path,
+                "dcd_frame": dcd_frame,
+                "max_abs_cv_delta": 0.0,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def save_aligned_state_dcds(
+    *,
+    dcd_path: str,
+    meta_state: np.ndarray,
+    out_dir: str,
+    top_path: str,
+    atomselect: Optional[str],
+    chunk_size: int,
+) -> pd.DataFrame:
+    """Stream all labeled frames into one DCD per core state.
+
+    Dataset row ``i`` must map directly to DCD frame ``i``. Frames with a
+    negative ``meta_state`` are intentionally omitted.
+    """
+
+    try:
+        import mdtraj as md
+    except Exception as exc:
+        raise SystemExit("Writing core-state DCDs requires mdtraj.") from exc
+
+    if chunk_size <= 0:
+        raise SystemExit("core_structures.dcd_chunk_size must be positive.")
+
+    states = sorted(int(state) for state in np.unique(meta_state) if int(state) >= 0)
+    if not states:
+        raise SystemExit("core_structures found no dataset rows with meta_state >= 0.")
+
+    atom_indices = None
+    if atomselect:
+        topology = md.load_topology(top_path)
+        atom_indices = topology.select(str(atomselect))
+        if atom_indices.size == 0:
+            raise SystemExit(f"core_structures.atomselect selected zero atoms: {atomselect}")
+
+    final_paths = {
+        state: os.path.join(out_dir, f"core_state_{state:03d}.dcd") for state in states
+    }
+    temp_paths = {state: f"{path}.tmp" for state, path in final_paths.items()}
+    counts = {state: 0 for state in states}
+    cursor = 0
+
+    try:
+        with ExitStack() as stack:
+            writers = {
+                state: stack.enter_context(
+                    md.formats.DCDTrajectoryFile(temp_paths[state], mode="w", force_overwrite=True)
+                )
+                for state in states
+            }
+            for chunk in md.iterload(
+                dcd_path,
+                chunk=chunk_size,
+                top=top_path,
+                atom_indices=atom_indices,
+            ):
+                stop = cursor + chunk.n_frames
+                labels = meta_state[cursor:stop]
+                if labels.shape[0] != chunk.n_frames:
+                    raise SystemExit(
+                        "Dataset/DCD alignment changed while exporting state DCDs: "
+                        f"needed labels through frame {stop}, but only {meta_state.shape[0]} exist."
+                    )
+                for state in states:
+                    selected = np.flatnonzero(labels == state)
+                    if selected.size == 0:
+                        continue
+                    cell_lengths = None
+                    cell_angles = None
+                    if chunk.unitcell_lengths is not None:
+                        cell_lengths = chunk.unitcell_lengths[selected] * 10.0
+                    if chunk.unitcell_angles is not None:
+                        cell_angles = chunk.unitcell_angles[selected]
+                    # The low-level DCD writer uses Angstrom, whereas MDTraj's
+                    # Trajectory.xyz arrays are expressed in nanometers.
+                    writers[state].write(
+                        chunk.xyz[selected] * 10.0,
+                        cell_lengths=cell_lengths,
+                        cell_angles=cell_angles,
+                    )
+                    counts[state] += int(selected.size)
+                cursor = stop
+    except BaseException:
+        for path in temp_paths.values():
+            if os.path.exists(path):
+                os.unlink(path)
+        raise
+
+    if cursor != meta_state.shape[0]:
+        for path in temp_paths.values():
+            if os.path.exists(path):
+                os.unlink(path)
+        raise SystemExit(
+            "Dataset/DCD alignment changed while exporting state DCDs: "
+            f"read {cursor} DCD frames for {meta_state.shape[0]} dataset rows."
+        )
+
+    rows: List[Dict[str, Any]] = []
+    for state in states:
+        expected = int(np.count_nonzero(meta_state == state))
+        if counts[state] != expected:
+            raise RuntimeError(
+                f"State {state} export wrote {counts[state]} frames; expected {expected}."
+            )
+        os.replace(temp_paths[state], final_paths[state])
+        rows.append(
+            {
+                "core_state": state,
+                "n_frames": counts[state],
+                "dcd": final_paths[state],
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def export_core_structures_from_dataset(cfg: Dict[str, Any]) -> str:
     struct_cfg = cfg.get("core_structures", {}) or {}
     if not bool(struct_cfg.get("enabled", True)):
@@ -678,6 +841,63 @@ def export_core_structures_from_dataset(cfg: Dict[str, Any]) -> str:
         import mdtraj as md
     except Exception as exc:
         raise SystemExit("Writing core structures requires mdtraj.") from exc
+
+    cv, meta_state, cv_headers, dist_to_centroid = load_core_dataset(dataset_path)
+    aligned_dcd = struct_cfg.get("aligned_dcd", struct_cfg.get("direct_dcd", None))
+    if aligned_dcd is not None:
+        aligned_dcd = str(aligned_dcd)
+        if not os.path.exists(aligned_dcd):
+            raise SystemExit(f"core_structures.aligned_dcd not found: {aligned_dcd}")
+        n_dcd_frames = trajectory_n_frames(md, aligned_dcd, top_path)
+        if n_dcd_frames != cv.shape[0]:
+            raise SystemExit(
+                "core_structures.aligned_dcd requires one-to-one dataset-row/DCD-frame alignment, "
+                f"but dataset has {cv.shape[0]} rows and DCD has {n_dcd_frames} frames."
+            )
+
+        center_rows: List[Dict[str, Any]] = []
+        for state in sorted(np.unique(meta_state[meta_state >= 0]).tolist()):
+            state_rows = np.flatnonzero(meta_state == int(state))
+            dataset_row = int(state_rows[np.argmin(dist_to_centroid[state_rows])])
+            center_rows.append(
+                {
+                    "core_state": int(state),
+                    "dataset_row": dataset_row,
+                    "dcd_frame": dataset_row,
+                    "dcd": aligned_dcd,
+                    "dist_to_centroid": float(dist_to_centroid[dataset_row]),
+                    "max_abs_cv_delta": 0.0,
+                }
+            )
+        if not center_rows:
+            raise SystemExit("core_structures found no dataset rows with meta_state >= 0.")
+
+        frame_table = pd.DataFrame(center_rows)
+        frame_table.to_csv(os.path.join(out_dir, "frames.csv"), index=False)
+        written = save_aligned_core_pdbs(
+            frame_table=frame_table,
+            out_dir=out_dir,
+            top_path=top_path,
+            atomselect=struct_cfg.get("atomselect", struct_cfg.get("atom_selection", None)),
+        )
+        written.to_csv(os.path.join(out_dir, "summary.csv"), index=False)
+        counts = written.groupby("core_state").size().reset_index(name="n_pdbs")
+        counts.to_csv(os.path.join(out_dir, "counts.csv"), index=False)
+        message = f"[ok] wrote {len(written)} aligned core-state PDBs"
+        if bool(struct_cfg.get("write_state_dcds", False)):
+            state_dcds = save_aligned_state_dcds(
+                dcd_path=aligned_dcd,
+                meta_state=meta_state,
+                out_dir=out_dir,
+                top_path=top_path,
+                atomselect=struct_cfg.get("atomselect", struct_cfg.get("atom_selection", None)),
+                chunk_size=int(struct_cfg.get("dcd_chunk_size", 10000)),
+            )
+            state_dcds.to_csv(os.path.join(out_dir, "state_dcds.csv"), index=False)
+            message += f" and {len(state_dcds)} full labeled-state DCDs"
+        print(f"{message} to {out_dir}", flush=True)
+        return out_dir
+
     folders = [str(path) for path in struct_cfg.get("folders", [])]
     pairs = find_pairs_dcd_colvars(
         folders,
@@ -690,7 +910,6 @@ def export_core_structures_from_dataset(cfg: Dict[str, Any]) -> str:
     if tolerance <= 0.0:
         raise SystemExit("core_structures.tolerance must be positive.")
 
-    cv, meta_state, cv_headers, dist_to_centroid = load_core_dataset(dataset_path)
     match_cvs = [str(name) for name in struct_cfg.get("match_cvs", cv_headers)]
     if not match_cvs:
         raise SystemExit("core_structures.match_cvs could not be inferred; set it explicitly.")

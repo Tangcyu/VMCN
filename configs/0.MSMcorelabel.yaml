@@ -88,3 +88,15 @@ plotting:
   cv_pairs:
     - ["CV1", "CV2"]
   max_points: 200000
+
+# Optional independent export after a core-label dataset exists. Install the
+# `structures` extra, set enabled: true, and supply a topology plus either an
+# exactly row-aligned DCD or the DCD/colvars matching fields documented in
+# src/tensorq/MSMlabel/config.template.yaml.
+core_structures:
+  enabled: false
+  dataset_path: ./msmcv_out/06_core_labels/lag_50/m_4/dataset.pt
+  top: /path/to/topology.psf
+  aligned_dcd: /path/to/aligned_combined_trajectory.dcd
+  write_state_dcds: false
+  dcd_chunk_size: 10000

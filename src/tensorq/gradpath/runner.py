@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import glob
+import math
 import os
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -462,9 +465,53 @@ def run_gradpath(config: dict[str, Any]) -> dict[str, Any]:
         num_images=int(config.get("num_images", config.get("tmp_images", 50))),
         periods=cluster_periods,
     )
+
+    # Discard sparsely populated pathway clusters. In automatic-pair runs the
+    # P_jump cutoff also acts as the minimum fraction of max_points that a
+    # pathway cluster must contain.
+    max_points_for_filter = config.get("max_points", None)
+    if max_points_for_filter is None or int(max_points_for_filter) <= 0:
+        max_points_for_filter = len(paths)
+    cluster_min_fraction = float(config.get("prob_threshold", 0.0))
+    if cluster_min_fraction < 0.0:
+        raise ValueError("prob_threshold must be nonnegative.")
+    cluster_min_members = int(math.ceil(cluster_min_fraction * int(max_points_for_filter)))
+    clusters_before_filter = list(clusters)
+    discarded_clusters = [
+        {
+            "label": int(cluster.label),
+            "n_members": int(cluster.member_indices.size),
+            "total_weight": float(cluster.total_weight),
+        }
+        for cluster in clusters_before_filter
+        if int(cluster.member_indices.size) < cluster_min_members
+    ]
+    retained_clusters = [
+        cluster
+        for cluster in clusters_before_filter
+        if int(cluster.member_indices.size) >= cluster_min_members
+    ]
+    labels = np.zeros(len(paths), dtype=np.int64)
+    clusters = []
+    for new_label, cluster in enumerate(retained_clusters, start=1):
+        retained = replace(cluster, label=new_label)
+        clusters.append(retained)
+        labels[retained.member_indices] = new_label
+
+    if discarded_clusters:
+        discarded_members = sum(item["n_members"] for item in discarded_clusters)
+        print(
+            f"[GRADPATH] discarded {len(discarded_clusters)} cluster(s) "
+            f"({discarded_members} paths): n < {cluster_min_members} "
+            "= ceil(prob_threshold * max_points)"
+        )
+
     np.save(os.path.join(out_dir, "path_cluster_labels.npy"), labels)
     np.save(os.path.join(out_dir, "path_distance_matrix.npy"), distance_matrix)
     np.save(os.path.join(out_dir, "path_linkage.npy"), linkage)
+    for pattern in ("cluster_*_center_path.txt", "cluster_*_medoid_path.txt"):
+        for old_path in glob.glob(os.path.join(centers_dir, pattern)):
+            os.remove(old_path)
     for cluster in clusters:
         np.savetxt(os.path.join(centers_dir, f"cluster_{cluster.label:02d}_center_path.txt"), cluster.center_path)
         np.savetxt(os.path.join(centers_dir, f"cluster_{cluster.label:02d}_medoid_path.txt"), cluster.medoid_path)
@@ -593,6 +640,11 @@ def run_gradpath(config: dict[str, Any]) -> dict[str, Any]:
         "n_selected": int(selection.indices.size),
         "n_paths": int(len(paths)),
         "n_clusters": int(len(clusters)),
+        "n_clusters_before_population_filter": int(len(clusters_before_filter)),
+        "cluster_min_member_fraction": float(cluster_min_fraction),
+        "cluster_filter_max_points": int(max_points_for_filter),
+        "cluster_min_members": int(cluster_min_members),
+        "discarded_clusters": discarded_clusters,
         "device": str(device),
         "dtype": str(dtype).replace("torch.", ""),
         "integration_batch_size": config.get("integration_batch_size", config.get("shooting_batch_size", None)),

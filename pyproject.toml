@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "tensorq"
 version = "0.1.0"
 description = "Shared TensorQ package for next-hit and pair-wise committors."
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
   "matplotlib",
   "numpy",
@@ -21,8 +21,14 @@ dependencies = [
 [project.optional-dependencies]
 label = [
   "MDAnalysis",
-  "scikit-learn",
-  "scipy",
+]
+structures = ["mdtraj"]
+pcca = ["deeptime"]
+test = ["pytest>=7"]
+all = [
+  "MDAnalysis",
+  "deeptime",
+  "mdtraj",
 ]
 
 [project.scripts]

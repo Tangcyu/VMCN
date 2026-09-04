@@ -50,6 +50,26 @@ DEFAULT_STAGE_CONFIGS = {
     "relabel": "configs/3.Relabel.yaml",
 }
 
+MSM_SUBSTEP_ALIASES = {
+    "data": "data",
+    "prepare_data": "data",
+    "cluster": "cluster",
+    "clustering": "cluster",
+    "microstates": "cluster",
+    "msm": "msm",
+    "pcca": "pcca",
+    "pcca+": "pcca",
+    "core": "core",
+    "cores": "core",
+    "core_label": "core",
+    "core_labels": "core",
+    "core_labeling": "core",
+    "structure": "structures",
+    "structures": "structures",
+    "core_structure": "structures",
+    "core_structures": "structures",
+}
+
 
 def load_yaml(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as handle:
@@ -111,13 +131,26 @@ def _configured_substeps(raw: dict[str, Any], default: Iterable[str]) -> list[st
     return [str(item).strip().lower().replace("-", "_") for item in value]
 
 
-def run_msm_core_label(raw: dict[str, Any]) -> None:
+def run_msm_core_label(raw: dict[str, Any], requested: str | None = None) -> None:
     from tensorq.MSMlabel.pipeline import run_pipeline
 
-    # This is the same complete pipeline selected by:
-    # python -m tensorq.MSMlabel.cli all CONFIG
     config = _section(raw, "MSM_CORE_LABEL", "MSMCORELABEL")
-    run_pipeline(config, stage="all")
+    if requested is None:
+        # This is the same complete pipeline selected by:
+        # python -m tensorq.MSMlabel.cli all CONFIG
+        run_pipeline(config, stage="all")
+        return
+
+    key = str(requested).strip().lower().replace("-", "_")
+    try:
+        substep = MSM_SUBSTEP_ALIASES[key]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown MSM/core-label substep {requested!r}; use data, cluster, "
+            "msm, pcca, core, or structures."
+        ) from exc
+    print(f"\n[PIPELINE] msmcorelabel/{substep} (reusing upstream checkpoints)")
+    run_pipeline(config, stage=substep, reuse_upstream=True)
 
 
 def run_committor_vector(raw: dict[str, Any], requested: str | None = None) -> None:
@@ -151,6 +184,8 @@ def run_committor_vector(raw: dict[str, Any], requested: str | None = None) -> N
 
 
 def run_gradpath(raw: dict[str, Any], requested: str | None = None) -> None:
+    from tensorq.gradpath.runner import run_gradpath as run_single_gradpath
+
     grad_cfg = _section(raw, "GRADPATH", "GradPath")
     merge_cfg = _section(raw, "VORONOI_MERGE", "GRADPATH_MERGY", "gradpath_mergy")
     substeps = [requested] if requested else _configured_substeps(
@@ -165,8 +200,6 @@ def run_gradpath(raw: dict[str, Any], requested: str | None = None) -> None:
                 key in grad_cfg for key in ("p_jump", "p_jump_path")
             )
             print(f"\n[PIPELINE] gradpath/{name}")
-            from tensorq.gradpath.runner import run_gradpath as run_single_gradpath
-
             if automatic:
                 from tensorq.gradpath.state_p import run_gradpath_for_state_pairs
 
@@ -293,9 +326,7 @@ def run_stage(stage: str, main_config: Path, substep: str | None = None) -> None
     raw, stage_path = _load_stage_config(main_config, stage)
     print(f"[PIPELINE] config: {stage_path}")
     if stage == "msmcorelabel":
-        if substep is not None:
-            raise ValueError("MSM core labeling has no run.py substeps; use --step msmcorelabel.")
-        run_msm_core_label(raw)
+        run_msm_core_label(raw, substep)
     elif stage == "committorvector":
         run_committor_vector(raw, substep)
     elif stage == "gradpath":
@@ -321,7 +352,10 @@ def main() -> None:
     parser.add_argument(
         "--substep",
         default=None,
-        help="Optional single substep, e.g. train, rate_constant, pathfinding, merging, or gini.",
+        help=(
+            "Optional single substep, e.g. data, msm, pcca, core, train, "
+            "rate_constant, pathfinding, merging, or gini."
+        ),
     )
     args = parser.parse_args()
     config_path = Path(args.config).expanduser().resolve()

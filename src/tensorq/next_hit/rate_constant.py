@@ -15,6 +15,69 @@ from ..common.flux import make_thresholds, resolve_ordered_pairs
 from .predict import check_probability_rows, infer_probabilities, load_committor_model
 
 
+def trajectory_burn_in_mask(
+    traj_id: torch.Tensor | None,
+    n_frames: int,
+    discard_first_n_frames: int,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Mask the first N saved frames of every consecutive trajectory block."""
+
+    n_frames = int(n_frames)
+    discard = int(discard_first_n_frames)
+    if n_frames < 0:
+        raise ValueError("n_frames must be nonnegative.")
+    if discard < 0:
+        raise ValueError("discard_first_n_frames must be nonnegative.")
+
+    if traj_id is None:
+        ids = np.zeros(n_frames, dtype=np.int64)
+        has_trajectory_ids = False
+    else:
+        ids = traj_id.detach().cpu().numpy().reshape(-1)
+        if ids.shape[0] != n_frames:
+            raise ValueError(f"traj_id has {ids.shape[0]} frames but the dataset has {n_frames}.")
+        has_trajectory_ids = True
+
+    keep = np.ones(n_frames, dtype=bool)
+    if n_frames:
+        boundaries = np.flatnonzero(ids[1:] != ids[:-1]) + 1
+        starts = np.r_[0, boundaries].astype(np.int64)
+        stops = np.r_[boundaries, n_frames].astype(np.int64)
+    else:
+        starts = np.asarray([], dtype=np.int64)
+        stops = np.asarray([], dtype=np.int64)
+
+    per_trajectory: list[dict[str, Any]] = []
+    for block_index, (start, stop) in enumerate(zip(starts, stops)):
+        block_size = int(stop - start)
+        n_discard = min(discard, block_size)
+        keep[start : start + n_discard] = False
+        label = ids[start]
+        if isinstance(label, np.generic):
+            label = label.item()
+        per_trajectory.append(
+            {
+                "block_index": int(block_index),
+                "trajectory_id": label,
+                "n_frames": block_size,
+                "n_discarded": int(n_discard),
+                "n_retained": int(block_size - n_discard),
+            }
+        )
+
+    n_discarded = int(np.count_nonzero(~keep))
+    return keep, {
+        "discard_first_n_frames": int(discard),
+        "reference": "original_saved_dataset_frames",
+        "has_trajectory_ids": bool(has_trajectory_ids),
+        "n_trajectory_blocks": int(len(per_trajectory)),
+        "n_frames_before_discard": int(n_frames),
+        "n_frames_discarded": n_discarded,
+        "n_frames_retained": int(n_frames - n_discarded),
+        "per_trajectory": per_trajectory,
+    }
+
+
 def resolve_lag_timing(config: dict[str, Any], dataset_stride: int) -> dict[str, Any]:
     """
     Resolve configured lag to the index step used after dataset_stride.
@@ -1511,7 +1574,24 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
 
     dataset_stride = int(config.get("dataset_stride", 1))
     raw_pack = load_dataset(dataset_path)
+    burn_in_mask_raw, burn_in_stats = trajectory_burn_in_mask(
+        raw_pack.traj_id,
+        int(raw_pack.features.shape[0]),
+        int(config.get("discard_first_n_frames", 0)),
+    )
     pack = apply_stride(raw_pack, dataset_stride)
+    burn_in_mask = burn_in_mask_raw[::dataset_stride]
+    if burn_in_mask.shape[0] != int(pack.features.shape[0]):
+        raise RuntimeError("Internal burn-in mask length does not match the strided dataset.")
+    burn_in_stats["dataset_stride"] = int(dataset_stride)
+    burn_in_stats["n_frames_after_stride_before_discard"] = int(pack.features.shape[0])
+    burn_in_stats["n_frames_after_stride_retained"] = int(np.count_nonzero(burn_in_mask))
+    if burn_in_stats["n_frames_discarded"] > 0:
+        print(
+            f"[RATE] Discarded the first {burn_in_stats['discard_first_n_frames']} frame(s) "
+            f"from each of {burn_in_stats['n_trajectory_blocks']} trajectory block(s): "
+            f"{burn_in_stats['n_frames_discarded']} frames removed."
+        )
     n_states = infer_n_states(pack, config.get("n_states", None))
     q = load_or_infer_q(
         config,
@@ -1537,6 +1617,18 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
     )
     idx0 = idx0_t.numpy()
     idx1 = idx1_t.numpy()
+    n_pairs_before_burn_in = int(idx0.size)
+    burn_in_pair_mask = burn_in_mask[idx0] & burn_in_mask[idx1]
+    idx0 = idx0[burn_in_pair_mask]
+    idx1 = idx1[burn_in_pair_mask]
+    if idx0.size == 0:
+        raise RuntimeError(
+            "No lagged pairs remain after discard_first_n_frames filtering. "
+            "Reduce discard_first_n_frames or lag."
+        )
+    burn_in_stats["n_lagged_pairs_before_discard"] = n_pairs_before_burn_in
+    burn_in_stats["n_lagged_pairs_discarded"] = int(n_pairs_before_burn_in - idx0.size)
+    burn_in_stats["n_lagged_pairs_retained"] = int(idx0.size)
 
     threshold_t = make_thresholds(
         config.get("thresholds", None),
@@ -1555,6 +1647,7 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
     state = pack.state.numpy().astype(np.int64)
     validate_rate_inputs(q, weights, state, idx0, idx1, n_states)
     positive_frame_mask, positive_pair_mask, zero_weight_mask_stats = positive_weight_masks(weights, idx0, idx1)
+    positive_frame_mask &= burn_in_mask
     idx0 = idx0[positive_pair_mask]
     idx1 = idx1[positive_pair_mask]
     q_weighted = q[positive_frame_mask]
@@ -1751,6 +1844,7 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
     assert k_mfpt_std is not None
 
     np.save(os.path.join(out_dir, "Q.npy"), q.astype(np.float32))
+    np.save(os.path.join(out_dir, "burn_in_keep_mask.npy"), burn_in_mask)
     np.save(os.path.join(out_dir, "pi.npy"), pi)
     np.save(os.path.join(out_dir, "T_hit.npy"), T_hit)
     np.save(os.path.join(out_dir, "J_thresholds.npy"), J)
@@ -1861,6 +1955,7 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
         "rate_sanitize": rate_sanitize,
         "kinetic_edge_filter": kinetic_edge_filter_stats,
         "n_lagged_pairs": int(len(idx0)),
+        "trajectory_burn_in": burn_in_stats,
         "zero_weight_mask": zero_weight_mask_stats,
         "error_analysis": {
             "enabled": bool(error_enabled),
@@ -1871,6 +1966,7 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
             "min_pairs_per_block": int(error_min_pairs),
         },
         "rate_outputs": {
+            "burn_in_keep_mask": os.path.abspath(os.path.join(out_dir, "burn_in_keep_mask.npy")),
             "T_hit": os.path.abspath(os.path.join(out_dir, "T_hit.npy")),
             "k_direct_raw": os.path.abspath(os.path.join(out_dir, "k_direct_raw.npy")),
             "k_direct_unfiltered": os.path.abspath(os.path.join(out_dir, "k_direct_unfiltered.npy")),

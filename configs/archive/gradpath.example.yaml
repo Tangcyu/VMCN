@@ -14,7 +14,7 @@ GRADPATH:
   max_points: 100
   seed: 30
 
-  # ------- Automatic multi-pair mode (used by scripts/grad_state_p.py) -------
+  # ------- Automatic multi-pair mode (used by scripts/gradpath_state_p.py) -------
   # Reads P_jump.csv from rate_constant.py output and automatically runs
   # gradpath for every state pair with P_jump[i,j] > prob_threshold.
   # Results are saved under out_dir/state_i_j/.

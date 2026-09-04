@@ -161,6 +161,12 @@ core_structures:
   #   PYTHONPATH=src python -m tensorq.MSMlabel.cli structures config.yaml
   # This does not rerun data/clustering/MSM/PCCA/core labeling.
   dataset_path: ./msmcv_out/06_core_labels/lag_50/m_4/dataset.pt
+  # Fast path when dataset row i is exactly DCD frame i. This avoids needing
+  # colvars matching and writes the minimum-dist_to_centroid frame per state.
+  # aligned_dcd: /path/to/aligned_combined_trajectory.dcd
+  # Also stream every frame with meta_state >= 0 into core_state_NNN.dcd.
+  write_state_dcds: false
+  dcd_chunk_size: 10000
   top: /path/to/topology.psf
   folders:
     - /path/to/original/trajectory/root

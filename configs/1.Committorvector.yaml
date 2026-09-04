@@ -57,6 +57,9 @@ NEXT_HIT_RATE:
   model: ./next_hit_train/next_hit_committor_best_checkpoint.pt
   out_dir: ./next_hit_rate
   device: cuda:0
+  # Remove the first N original saved frames from every trajectory before
+  # estimating populations, fluxes, rates, and MFPTs.
+  discard_first_n_frames: 0
   lag: 1
   lag_reference: original_frames
   n_thresholds: 9

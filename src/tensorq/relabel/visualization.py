@@ -5,6 +5,7 @@ import os
 import numpy as np
 
 from ..common.config import ensure_dir
+from .settings import analysis_settings
 
 
 def _thin_indices(indices, max_points):
@@ -150,6 +151,64 @@ def _candidate_legend(ax):
     ax.legend(handles=handles, frameon=False, fontsize=7, loc="best")
 
 
+def _plot_label_consistency(old_state, label_consistency, config, plot_dir, fmt):
+    """Plot the mean predicted probability of each frame's assigned label."""
+    old_state = np.asarray(old_state, dtype=np.int64)
+    label_consistency = np.asarray(label_consistency, dtype=np.float64)
+    valid = (old_state >= 0) & np.isfinite(label_consistency)
+    labels = np.unique(old_state[valid])
+    if labels.size == 0:
+        return None
+
+    means = np.asarray(
+        [np.mean(label_consistency[(old_state == label) & valid]) for label in labels],
+        dtype=np.float64,
+    )
+    counts = np.asarray(
+        [np.sum((old_state == label) & np.isfinite(label_consistency)) for label in labels],
+        dtype=np.int64,
+    )
+    q_cutoff = float(analysis_settings(config)["q_cutoff"])
+
+    import matplotlib.pyplot as plt
+
+    width = max(6.4, min(16.0, 0.7 * labels.size + 2.5))
+    fig, ax = plt.subplots(figsize=(width, 5.0), dpi=160)
+    x = np.arange(labels.size)
+    bars = ax.bar(x, means, color="#4c78a8", edgecolor="black", linewidth=0.4)
+    ax.axhline(
+        q_cutoff,
+        color="#d62728",
+        linestyle="--",
+        linewidth=1.3,
+        label=f"q_cutoff = {q_cutoff:g}",
+    )
+    ax.set_xticks(x, [str(int(label)) for label in labels])
+    ax.set_xlabel("Original assigned label")
+    ax.set_ylabel("Mean predicted q of assigned label")
+    ax.set_title("Mean own-label prediction (label consistency)")
+    ax.set_ylim(0.0, 1.05)
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend(frameon=False)
+
+    if labels.size <= 30:
+        for bar, mean, count in zip(bars, means, counts):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                min(1.025, mean + 0.02),
+                f"{mean:.6f}\nn={int(count)}",
+                ha="center",
+                va="bottom",
+                fontsize=7,
+            )
+
+    fig.tight_layout()
+    path = os.path.join(plot_dir, f"relabel_label_consistency.{fmt}")
+    fig.savefig(path)
+    plt.close(fig)
+    return path
+
+
 def plot_relabel_diagnostics(pack, graph_features, old_state, proposal, config, output_dir):
     if not _plot_enabled(config):
         return []
@@ -172,6 +231,16 @@ def plot_relabel_diagnostics(pack, graph_features, old_state, proposal, config, 
     saved = []
 
     projection = {"projection": "3d"} if is_3d else {}
+
+    path = _plot_label_consistency(
+        old_state,
+        scores["label_consistency"],
+        config,
+        plot_dir,
+        fmt,
+    )
+    if path is not None:
+        saved.append(path)
 
     lagged = scores.get("mean_lagged_entropy_norm")
     has_lagged = lagged is not None and np.any(np.isfinite(lagged))

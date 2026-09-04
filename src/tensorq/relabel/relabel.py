@@ -36,6 +36,7 @@ from .kinetics import (
     _split_labels_by_final_knn_kinetics,
 )
 from .lag_pair_utils import build_lag_pairs
+from .rate_merge import merge_macrostates_from_rates
 from .utils import _entropy_confidence, _save_dataset_like_input
 from .visualization import plot_relabel_diagnostics
 from .settings import analysis_settings
@@ -933,6 +934,17 @@ def run_relabel(dataset_path, model_path, config, device="cuda:0", batch_size=65
     masks = proposal["masks"]
     tables = proposal["tables"]
     diagnostics = proposal["diagnostics"]
+    new_state, rate_merge_groups, rate_merge_edges, rate_merge_mapping = (
+        merge_macrostates_from_rates(new_state, config, n_states)
+    )
+    proposal["proposed_labels"] = new_state
+    proposal["changed_mask"] = new_state != state
+    proposal["masks"]["changed"] = proposal["changed_mask"]
+    proposal["tables"]["rate_merge_groups"] = rate_merge_groups
+    proposal["tables"]["rate_merge_edges"] = rate_merge_edges
+    proposal["tables"]["rate_merge_label_mapping"] = rate_merge_mapping
+    if bool(_relabel_cfg(config).get("rate_merge_enabled", False)):
+        diagnostics["pipeline"].append("rate_probability_mfpt_merge")
 
     output_dir = ensure_dir(config.get("output_dir", "relabel_out"))
     _remove_stale_relabel_csv(output_dir)
@@ -979,6 +991,9 @@ def run_relabel(dataset_path, model_path, config, device="cuda:0", batch_size=65
         "reshaped_basin_groups": tables["reshaped_basin_groups"],
         "final_kinetic_merges": tables["final_kinetic_merges"],
         "final_kinetic_splits": tables["final_kinetic_splits"],
+        "rate_merge_groups": rate_merge_groups,
+        "rate_merge_edges": rate_merge_edges,
+        "rate_merge_label_mapping": rate_merge_mapping,
         "lagged_entropy_classification": diagnostics["lagged_entropy_classification"],
         "knn_backend_config": diagnostics["knn_backend_config"],
         "timings": timing_summary,
