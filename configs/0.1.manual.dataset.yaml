@@ -1,0 +1,63 @@
+# Manual labels -> shared VMCN dataset (no MSM, PCCA+, or clustering).
+# Build:   python run.py --step 0.1
+# Relabel: python run.py --step 0.1 --substep relabel
+# Replace the input paths and basin definitions with your annotations.
+
+TENSORQ_LABEL:
+  topology_file: /path/to/topology.psf
+  dcd_folder: /path/to/trajectories
+  match: shoot_
+  # Each matching DCD needs a same-stem .colvars.traj with a #-prefixed header.
+  output_dir: ./manual_dataset_out
+  dataset_path: ./manual_dataset_out/dataset.pt
+  save_format: pt
+  save_cv: true
+  every: 1
+  # true drops the first numeric colvars row (e.g. an extra step-0 record).
+  # Use false when colvars and DCD already contain the same frames.
+  colvars_mismatch: true
+  trajectory_workers: 1
+  write_concat_dcd: false
+
+  # Store these CVs as model features; include all columns used below.
+  cvs_to_save: [CV1, CV2]
+  periodic: false
+  riteweight_space: cv
+  cluster_space: cv
+  # Disable RiteWeight too, since its weighting procedure uses clustering.
+  reweight: false
+
+  labeling_method: user_defined_basins
+  user_defined_basins:
+    cvs_to_label: [CV1, CV2]
+    assignment_mode: box
+    # Labels must be contiguous 0..k-1. Frames outside all basins get -1.
+    # A box includes abs(CV - center) <= size; size is a half-width.
+    # Multiple centers for one state: replace center with centers: [[...], [...]].
+    basins:
+      - label: 0
+        center: [0.0, 0.0]
+        size: [0.2, 0.2]
+      - label: 1
+        center: [1.0, 1.0]
+        size: [0.2, 0.2]
+    # For Euclidean balls, use assignment_mode: distance_cutoff and replace
+    # each size with cutoff: 0.2. Distances do not wrap periodic coordinates.
+
+  write_diag_plots: false
+  plot_kmeans_centroids: false
+
+  # Alternative: label complete reference trajectories by known state.
+  # Replace labeling_method above with trajectory_anchors and uncomment below.
+  # Primary trajectories above remain -1; reference trajectories are appended.
+  # Keep reweight: false to avoid clustering. Each reference DCD also needs colvars.
+  # trajectory_anchors:
+  #   states:
+  #     - label: 0
+  #       name: A
+  #       dcd_folder: /path/to/state_A
+  #       match: stateA_
+  #     - label: 1
+  #       name: B
+  #       dcd_folder: /path/to/state_B
+  #       match: stateB_

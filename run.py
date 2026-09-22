@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the staged MSM-to-committor-vector workflow.
+"""Run the staged dataset-to-committor-vector workflow.
 
 The individual packages keep their native command-line interfaces.  This
 module only supplies a single dispatcher and a single top-level pipeline
@@ -30,6 +30,11 @@ STAGE_ALIASES = {
     "msmcorelabel": "msmcorelabel",
     "msm-to-core": "msmcorelabel",
     "msm_to_core": "msmcorelabel",
+    "0.1": "manual_dataset",
+    "manual_dataset": "manual_dataset",
+    "manual-dataset": "manual_dataset",
+    "manual": "manual_dataset",
+    "dataset_label": "manual_dataset",
     "1": "committorvector",
     "committor": "committorvector",
     "committorvector": "committorvector",
@@ -45,6 +50,7 @@ STAGE_ALIASES = {
 
 DEFAULT_STAGE_CONFIGS = {
     "msmcorelabel": "configs/0.MSMcorelabel.yaml",
+    "manual_dataset": "configs/0.1.manual.dataset.yaml",
     "committorvector": "configs/1.Committorvector.yaml",
     "gradpath": "configs/2.Gradpath.yaml",
     "relabel": "configs/3.Relabel.yaml",
@@ -151,6 +157,35 @@ def run_msm_core_label(raw: dict[str, Any], requested: str | None = None) -> Non
         ) from exc
     print(f"\n[PIPELINE] msmcorelabel/{substep} (reusing upstream checkpoints)")
     run_pipeline(config, stage=substep, reuse_upstream=True)
+
+
+def run_manual_dataset(raw: dict[str, Any], requested: str | None = None) -> None:
+    """Build labels directly from configured basins or labeled trajectories."""
+
+    substep = str(requested or "build").strip().lower().replace("-", "_")
+    if substep not in {"build", "relabel"}:
+        raise ValueError(
+            f"Unknown manual-dataset substep {requested!r}; use build or relabel."
+        )
+    config = _section(raw, "MANUAL_DATASET", "TENSORQ_LABEL", "NEXT_HIT_LABEL", "LABEL", "MultiState")
+    method = str(config.get("labeling_method", "user_defined_basins")).strip().lower()
+    if method not in {"user_defined_basins", "trajectory_anchors", "unbiased_anchors"}:
+        raise ValueError(
+            "manual_dataset requires labeling_method: user_defined_basins or trajectory_anchors."
+        )
+    if config.get("reweight", False):
+        raise ValueError(
+            "manual_dataset requires reweight: false; RiteWeight uses clustering."
+        )
+    config["labeling_method"] = method
+    config["reweight"] = False
+    config.setdefault("riteweight_space", "cv")
+    config.setdefault("cluster_space", "cv")
+
+    from tensorq.next_hit.label import run
+
+    print(f"\n[PIPELINE] manual_dataset/{substep}")
+    run(config, relabel_only=substep == "relabel")
 
 
 def run_committor_vector(raw: dict[str, Any], requested: str | None = None) -> None:
@@ -327,6 +362,8 @@ def run_stage(stage: str, main_config: Path, substep: str | None = None) -> None
     print(f"[PIPELINE] config: {stage_path}")
     if stage == "msmcorelabel":
         run_msm_core_label(raw, substep)
+    elif stage == "manual_dataset":
+        run_manual_dataset(raw, substep)
     elif stage == "committorvector":
         run_committor_vector(raw, substep)
     elif stage == "gradpath":
@@ -338,11 +375,11 @@ def run_stage(stage: str, main_config: Path, substep: str | None = None) -> None
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the TensorQ MSM-to-committor-vector workflow.")
+    parser = argparse.ArgumentParser(description="Run the TensorQ dataset-to-committor-vector workflow.")
     parser.add_argument(
         "--step",
         required=True,
-        help="Stage: 0/msmcorelabel, 1/committorvector, 2/gradpath, 3/relabel, or all.",
+        help="Stage: 0/msmcorelabel, 0.1/manual_dataset, 1/committorvector, 2/gradpath, 3/relabel, or all.",
     )
     parser.add_argument(
         "--config",
@@ -353,7 +390,7 @@ def main() -> None:
         "--substep",
         default=None,
         help=(
-            "Optional single substep, e.g. data, msm, pcca, core, train, "
+            "Optional single substep, e.g. data, msm, pcca, core, build, relabel, train, "
             "rate_constant, pathfinding, merging, or gini."
         ),
     )

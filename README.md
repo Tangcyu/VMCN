@@ -11,9 +11,9 @@ architecture:
 - `tensorq.MSMlabel`: MSM/PCCA+ macrostate discovery and VMCN core-label dataset export.
 
 The staged workflow creates its shared `.pt` or `.npz` dataset during MSM core
-labeling (step 0). For the alternative trajectory-labeling workflow, the
-maintained wrapper is `scripts/dataset_label.py` (installed as
-`tensorq-label`). Both committor families consume the same dataset format.
+labeling (step 0) or directly from manual annotations (step 0.1). Manual
+labeling also remains available through `scripts/dataset_label.py` (installed
+as `tensorq-label`). Both committor families consume the same dataset format.
 
 ## Environment and dependencies
 
@@ -54,10 +54,12 @@ python -m pytest -q
 
 ## Staged workflow
 
-`run.py` is the single dispatcher for the four-stage workflow. The default
-`config.yaml` points to one focused configuration file per stage:
+`run.py` is the single dispatcher for the four-stage workflow, including an
+alternative manual dataset stage. The default `config.yaml` points to one
+focused configuration file per stage:
 
 - `configs/0.MSMcorelabel.yaml`: weighted MSM, PCCA+, diagnostics, and core labels.
+- `configs/0.1.manual.dataset.yaml`: dataset from manually defined CV basins or labeled reference trajectories.
 - `configs/1.Committorvector.yaml`: next-hit training, inference, plotting, and rate constants.
 - `configs/2.Gradpath.yaml`: gradient pathfinding, weighted path clustering, plotting, and optional Voronoi merging.
 - `configs/3.Relabel.yaml`: diagnostics plus entropy (`H`) and Gini (`G`) relabeling.
@@ -71,6 +73,7 @@ Run from the repository root:
 
 ```bash
 python run.py --step 0       # MSM -> PCCA+ -> core-label dataset
+python run.py --step 0.1     # alternative: manual labels -> dataset
 python run.py --step 1       # next-hit committor vector
 python run.py --step 2       # gradpath and Voronoi workflow
 python run.py --step 3       # diagnose, H relabel, G relabel
@@ -93,8 +96,10 @@ prerequisites are built automatically for `data` through `core`. The
 independent `structures` exporter requires an existing core-label dataset and
 a configured topology/trajectory; it does not rebuild the MSM stages.
 
-`--step` also accepts the names `msmcorelabel`, `committorvector`, `gradpath`,
-`relabel`, and `all`. Use a direct stage YAML when desired:
+`--step` also accepts the names `msmcorelabel`, `manual_dataset`,
+`committorvector`, `gradpath`, `relabel`, and `all`. The manual stage also
+accepts `manual-dataset`, `manual`, and `dataset_label`. `--step all` runs the
+original MSM-based sequence (0, 1, 2, 3). Use a direct stage YAML when desired:
 
 ```bash
 python run.py --step 1 --config configs/1.Committorvector.yaml
@@ -148,6 +153,35 @@ write every labeled state to a separate DCD with `write_state_dcds: true`.
 Without `aligned_dcd`, it matches dataset CVs against the configured
 DCD/colvars pairs within `tolerance`. Both modes require the `structures`
 optional dependency.
+
+### Step 0.1: manual dataset (`manual_dataset`)
+
+```bash
+python run.py --step 0.1
+python run.py --step manual_dataset --config configs/0.1.manual.dataset.yaml
+python run.py --step 0.1 --substep relabel
+```
+
+This stage calls `tensorq.next_hit.label.run` using the `TENSORQ_LABEL`
+section in `configs/0.1.manual.dataset.yaml`. The default `build` substep
+reads topology and DCD/colvars pairs and assigns states from explicit CV
+basins. It skips MSM, PCCA+, and clustering; `reweight: false` also disables
+RiteWeight clustering and gives frames uniform normalized weights. Install
+the `label` optional dependency to read DCD trajectories.
+
+Replace the placeholder paths, CV names, and basin definitions before running.
+For `assignment_mode: box`, `size` is the half-width around `center` in each
+CV dimension. Labels must be contiguous from 0; frames outside all basins
+receive `-1`. The template also documents `trajectory_anchors`, which appends
+reference trajectories with known state labels and leaves the primary
+trajectories labeled `-1`.
+
+The output defaults to `./manual_dataset_out/dataset.pt`. Set
+`NEXT_HIT_COMMITTOR.dataset_path` and the `dataset` entries in the other
+`NEXT_HIT_*` sections of `configs/1.Committorvector.yaml` to this path, then
+run step 1. Update the dataset paths in steps 2 and 3 as needed. To change
+manual basin annotations on an existing dataset, use `--substep relabel`;
+it updates `dataset_path` in place and preserves features and weights.
 
 ### Step 1: next-hit committor vector (`committorvector`)
 
