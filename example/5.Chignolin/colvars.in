@@ -1,0 +1,28 @@
+colvarsTrajFrequency            100
+colvarsRestartFrequency         1000000
+
+colvar {
+    name end_to_end_distance
+    distance {
+        group1 {atomNumbers {5}}
+        group2 {atomNumbers {133}}
+    }
+}
+
+colvar {
+    name Asp3N-Gly7O
+
+    distance {
+        group1 {atomNumbers {31}}
+        group2 {atomNumbers {92}}
+    }
+}
+
+colvar {
+    name Asp3N-Thr8O
+
+    distance {
+        group1 {atomNumbers {31}}
+        group2 {atomNumbers {106}}
+    }
+}

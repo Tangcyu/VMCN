@@ -15,6 +15,9 @@ labeling (step 0) or directly from manual annotations (step 0.1). Manual
 labeling also remains available through `scripts/dataset_label.py` (installed
 as `tensorq-label`). Both committor families consume the same dataset format.
 
+Minimal NAMD inputs for reproducing the MD simulations are in [`example/`](example/), organized as `1.Triangular.Triple-well`, `2.Lined-up.Triple-well`, `3.NANMA`, `4.Trialanine`, and `5.Chignolin`, with both `A.pdb` and `B.pdb` starting structures included for systems 3–5.
+From any system directory, run `namd3 +p1 namd.conf` with a CPU build of NAMD 3, setting `stateName` to `A` or `B` in `namd.conf` for systems 3–5; all required input files are included, and simulation outputs are written to `output/` with distinct A/B prefixes.
+
 ## Environment and dependencies
 
 VMCN requires Python 3.10 or newer; Python 3.12 is used for current

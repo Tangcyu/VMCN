@@ -1,0 +1,20 @@
+colvarsTrajFrequency     100
+colvarsRestartFrequency  5000
+
+colvar {
+   name X
+     distanceZ {
+      axis (1., 0., 0.)
+      main { atomNumbers { 1 } }
+      ref { dummyAtom (0.,0.,0.) }
+   }
+}
+
+colvar {
+   name Y
+      distanceZ {
+      axis (0., 1., 0.)
+      main { atomNumbers { 1 } }
+      ref { dummyAtom (0.,0.,0.) }
+   }
+}
